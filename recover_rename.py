@@ -241,6 +241,17 @@ def office_title(path, ext):
                 return sanitize(el.text)
     except Exception:
         pass
+    if ext == ".xlsx":
+        try:
+            xml = z.read("xl/sharedStrings.xml").decode("utf-8", "ignore")
+            texts = [re.sub(r"<[^>]+>", "", m) for m in re.findall(r"<si>(.*?)</si>", xml, re.S)[:12]]
+            s = first_line("\n".join(texts))
+            if s: return s
+            wb = z.read("xl/workbook.xml").decode("utf-8", "ignore")
+            m = re.search(r'<sheet [^>]*name="([^"]+)"', wb)
+            if m and sanitize(m.group(1)): return sanitize(m.group(1))
+        except Exception:
+            pass
     if ext == ".docx":
         try:
             xml = z.read("word/document.xml").decode("utf-8", "ignore")
@@ -419,6 +430,51 @@ def cmd_run(a):
             lf.flush()
     print(f"Renamed: {ok}\nSkipped: {skipped} (listed in log)\nLog: {logp}")
 
+def cmd_office(a):
+    """Rename ONLY Word/Excel files, in place. No copy, no moving, no extra space."""
+    root = os.path.abspath(a.folder)
+    cands, legacy = [], 0
+    for p in iter_files(root):
+        try:
+            kind, ext = classify(p)
+        except OSError:
+            continue
+        if ext in (".docx", ".xlsx"): cands.append(p)
+        elif kind == "doc" and ext == ".doc": legacy += 1
+    print(f"Word/Excel files found: {len(cands)} (old-format .doc/.xls left untouched: {legacy})")
+    taken, rows = set(), []
+    for p in cands:
+        try:
+            _, base, ext, src = propose(p)
+            if src == "kept": rows.append((p, None, "no title found", None)); continue
+            name = unique(os.path.dirname(p), base, ext, taken)
+            new = os.path.join(os.path.dirname(p), name)
+            if os.path.normcase(new) == os.path.normcase(p): continue
+            rows.append((p, new, src, None))
+        except Exception as e:
+            rows.append((p, None, "skipped", f"{type(e).__name__}: {e}"))
+    todo = [r for r in rows if r[1]]
+    if not a.apply:
+        random.Random(1).shuffle(todo)
+        print(f"\nPREVIEW ONLY (nothing changed). {len(todo)} would be renamed; showing {min(a.n, len(todo))}:\n")
+        for old, new, src, _ in todo[:a.n]:
+            print(f"{os.path.relpath(old, root)}\n   -> {os.path.basename(new)}   [{src}]")
+        print(f"\n{len(rows)-len(todo)} would be left as they are (no readable title).")
+        return
+    logp = os.path.join(root, f"rename_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    ok = skipped = 0
+    with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
+        w = csv.writer(lf); w.writerow(["old_path", "new_path", "status", "source", "note"])
+        for old, new, src, err in rows:
+            if not new: w.writerow([old, "", "skipped", "", src if not err else err]); skipped += 1; continue
+            try:
+                if os.path.lexists(new): raise FileExistsError(new)
+                os.rename(old, new); w.writerow([old, new, "renamed", src, ""]); ok += 1
+            except Exception as e:
+                w.writerow([old, "", "skipped", "", f"{type(e).__name__}: {e}"]); skipped += 1
+            lf.flush()
+    print(f"Renamed: {ok}\nLeft as-is/skipped: {skipped}\nUndo log: {logp}")
+
 def cmd_undo(a):
     n = 0
     with open(a.log, newline="", encoding="utf-8-sig") as f:
@@ -481,6 +537,8 @@ def main():
         if name == "backup": p.add_argument("--dest", required=True, help="folder on ANOTHER drive")
         if name == "dryrun":
             p.add_argument("-n", type=int, default=20); p.add_argument("--seed", type=int, default=1)
+    p = sp.add_parser("office"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
+    p.add_argument("-n", type=int, default=20); p.set_defaults(fn=cmd_office)
     p = sp.add_parser("undo"); p.add_argument("log"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
