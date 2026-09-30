@@ -460,7 +460,9 @@ def cmd_office(a):
         for old, new, src, _ in todo[:a.n]:
             print(f"{os.path.relpath(old, root)}\n   -> {os.path.basename(new)}   [{src}]")
         print(f"\n{len(rows)-len(todo)} would be left as they are (no readable title).")
-        return
+        if not (todo and sys.stdin.isatty()): return
+        if input(f"\nType YES to rename all {len(todo)} files now (anything else = stop): ").strip() != "YES":
+            print("Stopped. Nothing was renamed."); return
     logp = os.path.join(root, f"rename_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
     ok = skipped = 0
     with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
