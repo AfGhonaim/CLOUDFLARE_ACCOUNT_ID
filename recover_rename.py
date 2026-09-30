@@ -481,6 +481,55 @@ def cmd_office(a):
             lf.flush()
     print(f"Renamed: {ok}\nLeft as-is/skipped: {skipped}\nUndo log: {logp}")
 
+def cmd_media(a):
+    """Rename photos/videos IN PLACE by date taken. Only when a real date is inside the file."""
+    root = os.path.abspath(a.folder)
+    print("Scanning files (progress shown every 1000)...", flush=True)
+    rows, seen, nodate, stats = [], 0, 0, collections.Counter()
+    taken = set()
+    for p in iter_files(root):
+        seen += 1
+        if seen % 1000 == 0: print(f"  scanned {seen} files, {len(rows)} to rename so far", flush=True)
+        try:
+            kind, _ = classify(p)
+            if kind not in ("photo", "video"): continue
+            _, base, ext, src = propose(p)
+            stats[kind] += 1
+            if src not in ("exif", "container"):   # mtime of recovered files is unreliable
+                nodate += 1; rows.append((p, None, "no date inside file", None)); continue
+            stem = os.path.splitext(os.path.basename(p))[0]
+            if re.fullmatch(re.escape(base) + r"(_\d+)?", stem):  # already named this way
+                taken.add(p.lower()); continue
+            name = unique(os.path.dirname(p), base, ext, taken)
+            new = os.path.join(os.path.dirname(p), name)
+            rows.append((p, new, src, None))
+        except Exception as e:
+            rows.append((p, None, "skipped", f"{type(e).__name__}: {e}"))
+    todo = [r for r in rows if r[1]]
+    print(f"\nPhotos: {stats['photo']}  Videos: {stats['video']}")
+    print(f"With a real date inside: {len(todo)}   No date inside (left unchanged): {len(rows)-len(todo)}")
+    if not a.apply:
+        random.Random(1).shuffle(todo)
+        print(f"\nPREVIEW ONLY. Showing {min(a.n, len(todo))} examples:\n")
+        for old, new, src, _ in todo[:a.n]:
+            print(f"{os.path.relpath(old, root)}\n   -> {os.path.basename(new)}   [{src}]")
+        if not (todo and sys.stdin.isatty()): return
+        if input(f"\nType YES (capitals) to rename all {len(todo)} files now: ").strip() != "YES":
+            print("Stopped. Nothing was renamed."); return
+    logp = os.path.join(root, f"rename_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    ok = skipped = 0
+    with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
+        w = csv.writer(lf); w.writerow(["old_path", "new_path", "status", "source", "note"])
+        for old, new, src, err in rows:
+            if not new: w.writerow([old, "", "skipped", "", src if not err else err]); skipped += 1; continue
+            try:
+                if os.path.lexists(new): raise FileExistsError(new)
+                os.rename(old, new); w.writerow([old, new, "renamed", src, ""]); ok += 1
+            except Exception as e:
+                w.writerow([old, "", "skipped", "", f"{type(e).__name__}: {e}"]); skipped += 1
+            lf.flush()
+    print(f"Renamed: {ok}\nLeft as-is/skipped: {skipped}\nUndo log: {logp}")
+
 def cmd_undo(a):
     n = 0
     with open(a.log, newline="", encoding="utf-8-sig") as f:
@@ -545,6 +594,8 @@ def main():
             p.add_argument("-n", type=int, default=20); p.add_argument("--seed", type=int, default=1)
     p = sp.add_parser("office"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
     p.add_argument("-n", type=int, default=20); p.set_defaults(fn=cmd_office)
+    p = sp.add_parser("media"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
+    p.add_argument("-n", type=int, default=20); p.set_defaults(fn=cmd_media)
     p = sp.add_parser("undo"); p.add_argument("log"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
