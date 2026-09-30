@@ -433,8 +433,11 @@ def cmd_run(a):
 def cmd_office(a):
     """Rename ONLY Word/Excel files, in place. No copy, no moving, no extra space."""
     root = os.path.abspath(a.folder)
-    cands, legacy = [], 0
+    cands, legacy, seen = [], 0, 0
+    print("Scanning files (progress shown every 1000)...", flush=True)
     for p in iter_files(root):
+        seen += 1
+        if seen % 1000 == 0: print(f"  scanned {seen} files, {len(cands)} Word/Excel so far", flush=True)
         try:
             kind, ext = classify(p)
         except OSError:
@@ -443,7 +446,8 @@ def cmd_office(a):
         elif kind == "doc" and ext == ".doc": legacy += 1
     print(f"Word/Excel files found: {len(cands)} (old-format .doc/.xls left untouched: {legacy})")
     taken, rows = set(), []
-    for p in cands:
+    for i, p in enumerate(cands, 1):
+        if i % 500 == 0: print(f"  reading titles: {i}/{len(cands)}", flush=True)
         try:
             _, base, ext, src = propose(p)
             if src == "kept": rows.append((p, None, "no title found", None)); continue
