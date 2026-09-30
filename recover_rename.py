@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Rename and sort recovered files by content/metadata.
+EASY MODE: just double-click this file (or run it with no arguments).
 
 Standard library only. Optional: Pillow / mutagen are NOT required.
 
@@ -428,7 +429,51 @@ def cmd_undo(a):
                 os.rename(r["new_path"], r["old_path"]); n += 1
     print(f"Restored {n} files to original names/locations")
 
+def _ask(q, default=""):
+    v = input(f"{q} [{default}]: ").strip().strip('"')
+    return v or default
+
+def _pick_backup_drive(src, need):
+    import string
+    best = None
+    for L in string.ascii_uppercase:
+        d = f"{L}:\\"
+        if not os.path.exists(d) or os.path.splitdrive(src)[0].upper() == f"{L}:": continue
+        try: free = shutil.disk_usage(d).free
+        except OSError: continue
+        if free > need * 1.05 and (best is None or free > best[1]): best = (d, free)
+    return best[0] if best else None
+
+def wizard():
+    """Double-click mode: guided, asks before each risky step."""
+    try:
+        print("=== Recovered files: rename & sort ===\n")
+        folder = os.path.abspath(_ask("Folder with recovered files", r"I:\Recovery"))
+        if not os.path.isdir(folder): sys.exit(f"Folder not found: {folder}")
+        ns = argparse.Namespace(folder=folder)
+        print("\n[1/4] Scanning..."); cmd_scan(ns)
+        files = list(iter_files(folder))
+        need = sum(os.path.getsize(f) for f in files)
+        drive = _pick_backup_drive(folder, need)
+        dest = _ask(f"\n[2/4] Backup needs {need/1e9:.1f} GB. Backup folder (must be on ANOTHER drive)",
+                    os.path.join(drive, "Recovery_Backup") if drive else "")
+        if not dest: sys.exit("No other drive with enough space found. Connect one and try again.")
+        if _ask("Start backup? (yes/no)", "yes").lower() != "yes": sys.exit("Stopped. Nothing changed.")
+        cmd_backup(argparse.Namespace(folder=folder, dest=dest))
+        print("\n[3/4] Preview of 20 proposed names (nothing renamed yet):\n")
+        cmd_dryrun(argparse.Namespace(folder=folder, n=20, seed=1))
+        if _ask("\nNames look OK? Rename ALL files now? (yes/no)", "no").lower() != "yes":
+            sys.exit("Stopped. Nothing was renamed.")
+        print("\n[4/4] Renaming..."); cmd_run(ns)
+        print("\nDone. To undo, run: python recover_rename.py undo <log file above>")
+    except SystemExit as e:
+        if e.code: print(e.code)
+    except Exception as e:
+        print("ERROR:", e)
+    input("\nPress Enter to close...")
+
 def main():
+    if len(sys.argv) == 1: return wizard()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
     for name, fn in (("backup", cmd_backup), ("scan", cmd_scan), ("dryrun", cmd_dryrun), ("run", cmd_run)):
