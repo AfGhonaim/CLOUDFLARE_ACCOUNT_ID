@@ -748,6 +748,39 @@ Import-Csv -LiteralPath $args[0] -Encoding UTF8 | ForEach-Object {
 }
 """
 
+_WORD_PS = r"""
+Add-Type -AssemblyName System.Drawing
+$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+$ep = New-Object System.Drawing.Imaging.EncoderParameters(1)
+$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]80)
+$rows = @(Import-Csv -LiteralPath $args[0] -Encoding UTF8)
+try { $word = New-Object -ComObject Word.Application } catch { Write-Host "Microsoft Word could not be started."; exit 1 }
+$word.Visible = $false; $word.DisplayAlerts = 0; $word.AutomationSecurity = 3
+$n = 0
+foreach ($r in $rows) {
+  $n++
+  if ((Test-Path -LiteralPath $r.jpg) -and ((Get-Item -LiteralPath $r.jpg).Length -gt 200)) { continue }
+  $doc = $null
+  try {
+    $doc = $word.Documents.Open($r.docx, $false, $true, $false)
+    $doc.ActiveWindow.View.Type = 3
+    $bytes = $doc.ActiveWindow.ActivePane.Pages.Item(1).EnhMetaFileBits
+    $ms = New-Object System.IO.MemoryStream (, $bytes)
+    $mf = New-Object System.Drawing.Imaging.Metafile($ms)
+    $sc = 256.0 / [Math]::Max($mf.Width, $mf.Height)
+    $w = [Math]::Max(1, [int]($mf.Width * $sc)); $h = [Math]::Max(1, [int]($mf.Height * $sc))
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.Clear([System.Drawing.Color]::White); $g.InterpolationMode = 'HighQualityBicubic'
+    $g.DrawImage($mf, 0, 0, $w, $h)
+    $bmp.Save($r.jpg, $codec, $ep)
+    $g.Dispose(); $bmp.Dispose(); $mf.Dispose(); $ms.Dispose()
+  } catch { } finally { if ($doc) { try { $doc.Close($false) } catch { } } }
+  if ($n % 25 -eq 0) { Write-Host ("  pictures made: {0}/{1}" -f $n, $rows.Count) }
+}
+$word.Quit()
+"""
+
 _THUMB_REL = "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail"
 
 def embed_thumbnail(docx, jpg_bytes):
@@ -788,44 +821,53 @@ def embed_thumbnail(docx, jpg_bytes):
     return "added"
 
 def cmd_thumbs(a):
-    """Embed each page-1 picture inside its Word file as the Explorer thumbnail (file stays .docx)."""
+    """Give every Word file a page-1 thumbnail (stored inside the .docx; the file stays a normal Word file)."""
     pdir, root = os.path.abspath(a.previews), os.path.abspath(a.docx_root)
-    print("Linking pictures to Word files...", flush=True)
-    pairs = _picture_map(pdir, root)
-    print(f"  linked: {len(pairs)}", flush=True)
-    allpng = [f for f in os.listdir(pdir) if f.lower().endswith(".png")]
-    linked_png = {os.path.basename(pg) for _, pg in pairs}
-    alldocx = [q for q in iter_files(root) if q.lower().endswith(".docx")]
-    linked_doc = {d for d, _ in pairs}
-    logs = [f for f in os.listdir(root) if f.startswith("rename_log_") and f.endswith(".csv")]
-    print(f"  pictures: {len(allpng)}  not linked: {len(allpng)-len(linked_png)}   Word files: {len(alldocx)}  without picture: {len(alldocx)-len(linked_doc)}   rename logs read: {len(logs)}")
-    for n_ in [f for f in allpng if f not in linked_png][:4]: print("   picture not linked:", n_)
-    for q in [q for q in alldocx if q not in linked_doc][:4]: print("   Word file without picture:", os.path.basename(q))
-    if not a.all: pairs = pairs[:a.limit]; print(f"TEST MODE: only the first {len(pairs)} files. Add --all for everything.")
     jdir = os.path.join(os.environ.get("TEMP", pdir), "thumbs_jpg"); os.makedirs(jdir, exist_ok=True)
+    if a.from_pictures:
+        print("Linking pictures to Word files...", flush=True)
+        pairs = _picture_map(pdir, root); print(f"  linked: {len(pairs)}", flush=True)
+        todo = [(d, pg) for d, pg in pairs]
+    else:
+        print("Listing Word files (those without a thumbnail)...", flush=True)
+        todo = []
+        for q in iter_files(root):
+            if not q.lower().endswith(".docx"): continue
+            try:
+                with zipfile.ZipFile(q) as z:
+                    has = any(n.lower().startswith("docprops/thumbnail") for n in z.namelist())
+            except Exception:
+                continue
+            if a.force or not has: todo.append((q, None))
+        print(f"  Word files needing a thumbnail: {len(todo)}", flush=True)
+    if not a.all: todo = todo[:a.limit]; print(f"TEST MODE: only the first {len(todo)} files. Add --all for everything.")
     mp = os.path.join(jdir, "map.csv")
     with open(mp, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f); w.writerow(["png", "jpg"])
-        for i, (d, png) in enumerate(pairs): w.writerow([png, os.path.join(jdir, f"{i}.jpg")])
+        w = csv.writer(f); w.writerow(["docx", "png", "jpg"])
+        for i, (d, png) in enumerate(todo): w.writerow([d, png or "", os.path.join(jdir, f"{i}.jpg")])
     if not a.skip_convert:
-        print("Making small JPEG copies of the pictures (Windows)...", flush=True)
-        ps = os.path.join(jdir, "conv.ps1"); open(ps, "w", encoding="utf-8-sig").write(_JPG_PS)
         import subprocess
+        if a.from_pictures:
+            print("Making small JPEG copies of the pictures (Windows)...", flush=True)
+            ps = os.path.join(jdir, "conv.ps1"); open(ps, "w", encoding="utf-8-sig").write(_JPG_PS)
+        else:
+            print("Opening each file in Word to make its page-1 picture (this takes a while)...", flush=True)
+            ps = os.path.join(jdir, "word.ps1"); open(ps, "w", encoding="utf-8-sig").write(_WORD_PS)
         subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps, mp], check=False)
     logp = os.path.join(pdir, f"thumbs_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
     cnt = collections.Counter()
     with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
         w = csv.writer(lf); w.writerow(["docx", "picture", "status"])
-        for i, (d, png) in enumerate(pairs, 1):
+        for i, (d, png) in enumerate(todo, 1):
             jp = os.path.join(jdir, f"{i-1}.jpg")
             try:
-                if not os.path.exists(jp) or os.path.getsize(jp) < 200: st = "skipped: no jpeg made"
+                if not os.path.exists(jp) or os.path.getsize(jp) < 200: st = "skipped: no picture made"
                 else: st = embed_thumbnail(d, open(jp, "rb").read())
             except Exception as e:
                 st = f"failed: {type(e).__name__}: {e}"
-            cnt[st.split(":")[0]] += 1; w.writerow([d, png, st]); lf.flush()
-            if i % 100 == 0: print(f"  {i}/{len(pairs)}  added: {cnt['added']}", flush=True)
-    print(f"\nAdded thumbnails: {cnt['added']}   Already had: {cnt['already']}   Skipped/failed: {len(pairs)-cnt['added']-cnt['already']}\nLog: {logp}")
+            cnt[st.split(":")[0]] += 1; w.writerow([d, png or "", st]); lf.flush()
+            if i % 100 == 0: print(f"  embedded {i}/{len(todo)}  added: {cnt['added']}", flush=True)
+    print(f"\nAdded thumbnails: {cnt['added']}   Already had: {cnt['already']}   Skipped/failed: {len(todo)-cnt['added']-cnt['already']}\nLog: {logp}")
 
 def cmd_undo(a):
     n = 0
@@ -904,7 +946,8 @@ def main():
     p.set_defaults(fn=cmd_previews)
     p = sp.add_parser("thumbs"); p.add_argument("previews"); p.add_argument("docx_root")
     p.add_argument("--all", action="store_true"); p.add_argument("--limit", type=int, default=3)
-    p.add_argument("--skip-convert", action="store_true"); p.set_defaults(fn=cmd_thumbs)
+    p.add_argument("--skip-convert", action="store_true"); p.add_argument("--from-pictures", action="store_true")
+    p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_thumbs)
     p = sp.add_parser("undo"); p.add_argument("log"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
