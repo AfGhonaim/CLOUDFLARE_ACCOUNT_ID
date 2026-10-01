@@ -1131,18 +1131,25 @@ def _find_tesseract():
 
 _STOP_LINES = ("وزاره", "دوله", "بسم الله", "الرحمن", "المملكه", "جمهوريه", "ختم", "صوره")
 
-def _ocr_first_page(pdf, tess, dpi=150):
+def _ocr_first_page(pdf, tess, dpi=120, top=0.5):
     try: import pymupdf
     except ImportError: import fitz as pymupdf
     import subprocess, tempfile
     doc = pymupdf.open(pdf)
     if doc.page_count == 0: return ""
-    pix = doc[0].get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY)
+    pg = doc[0]; r = pg.rect
+    pix = pg.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, clip=pymupdf.Rect(r.x0, r.y0, r.x1, r.y0 + r.height * top))
     doc.close()
+    env = dict(os.environ, OMP_THREAD_LIMIT="1")          # one thread per OCR job; parallelism is across files
     with tempfile.TemporaryDirectory() as td:
         img = os.path.join(td, "p.png"); pix.save(img)
-        r = subprocess.run([tess, img, "stdout", "-l", "ara+eng", "--psm", "3"], capture_output=True, timeout=180)
-    return r.stdout.decode("utf-8", "ignore")
+        res = subprocess.run([tess, img, "stdout", "-l", "ara+eng", "--psm", "6"], capture_output=True, timeout=120, env=env)
+    return res.stdout.decode("utf-8", "ignore")
+
+def _ocr_task(args):
+    p, tess, dpi, top = args
+    try: return p, _ocr_first_page(p, tess, dpi, top)
+    except BaseException: return p, ""
 
 def _fix_dir(text):
     """OCR/PDF text sometimes comes back in visual (reversed) order; put Arabic lines back in reading order."""
@@ -1203,27 +1210,30 @@ def cmd_pdfocr(a):
     if a.apply:
         lf = open(logp, "w", newline="", encoding="utf-8-sig"); lw = csv.writer(lf); lw.writerow(["old_path", "new_path", "status", "source", "note"])
         cf = open(cache_p, "a", newline="", encoding="utf-8-sig"); cw = csv.writer(cf)
-    for p in files:
-        done += 1
-        try: text = _ocr_first_page(p, tess)
-        except Exception as e: text = ""
-        name, src = _name_from_ocr(text, a.titles)
-        if not a.apply:
-            snip = re.sub(r"\s+", " ", text).strip()[:90]
-            print(f"{os.path.basename(p)}\n   OCR: {snip}\n   -> {name + '.pdf' + '   [' + src + ']' if name else '(kept: no case number found)'}", flush=True)
-        else:
-            if name:
-                try:
-                    new = os.path.join(os.path.dirname(p), unique(os.path.dirname(p), name, ".pdf", taken))
-                    if os.path.lexists(new): raise FileExistsError(new)
-                    os.rename(p, new); lw.writerow([p, new, "renamed", src, ""]); named += 1
-                except Exception as e: lw.writerow([p, "", "skipped", "", str(e)]); cw.writerow([p, ""])
-            else: cw.writerow([p, ""])
-            lf.flush(); cf.flush()
-            if done % 25 == 0:
-                rate = done / max(1, time.time() - t0); left = (len(files) - done) / max(rate, 1e-9)
-                print(f"  {done}/{len(files)}  renamed: {named}  about {left/3600:.1f} h left", flush=True)
-        if name: named += 0 if a.apply else 1
+    from concurrent.futures import ProcessPoolExecutor
+    workers = a.workers or max(1, (os.cpu_count() or 2) - 1)
+    print(f"Using {workers} parallel workers; reading the top {int(a.top*100)}% of page 1 at {a.dpi} dpi.", flush=True)
+    jobs = [(p, tess, a.dpi, a.top) for p in files]
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for p, text in ex.map(_ocr_task, jobs, chunksize=2):
+            done += 1
+            name, src = _name_from_ocr(text, a.titles)
+            if not a.apply:
+                snip = re.sub(r"\s+", " ", text).strip()[:90]
+                print(f"{os.path.basename(p)}\n   OCR: {snip}\n   -> {name + '.pdf' + '   [' + src + ']' if name else '(kept: no case number found)'}", flush=True)
+            else:
+                if name:
+                    try:
+                        new = os.path.join(os.path.dirname(p), unique(os.path.dirname(p), name, ".pdf", taken))
+                        if os.path.lexists(new): raise FileExistsError(new)
+                        os.rename(p, new); lw.writerow([p, new, "renamed", src, ""]); named += 1
+                    except Exception as e: lw.writerow([p, "", "skipped", "", str(e)]); cw.writerow([p, ""])
+                else: cw.writerow([p, ""])
+                lf.flush(); cf.flush()
+                if done % 100 == 0:
+                    rate = done / max(1, time.time() - t0); left = (len(files) - done) / max(rate, 1e-9)
+                    print(f"  {done}/{len(files)}  renamed: {named}  about {left/60:.0f} min left", flush=True)
+            if name and not a.apply: named += 1
     print(f"\nDone. Processed: {done}   {'Renamed' if a.apply else 'Would be renamed'}: {named}" + (f"\nUndo log: {logp}" if a.apply else ""))
 
 def cmd_undo(a):
@@ -1322,7 +1332,9 @@ def main():
     p.add_argument("--seed", type=int, default=1); p.set_defaults(fn=cmd_pdfstat)
     p = sp.add_parser("pdfocr"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
     p.add_argument("--all", action="store_true"); p.add_argument("--limit", type=int, default=0)
-    p.add_argument("--titles", action="store_true"); p.add_argument("--seed", type=int, default=1); p.set_defaults(fn=cmd_pdfocr)
+    p.add_argument("--titles", action="store_true"); p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--workers", type=int, default=0); p.add_argument("--dpi", type=int, default=120)
+    p.add_argument("--top", type=float, default=0.5, help="fraction of the page height to read, from the top"); p.set_defaults(fn=cmd_pdfocr)
     p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
