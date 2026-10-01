@@ -939,6 +939,7 @@ def cmd_content(a):
             found += 1
             if ext == ".pdf": text, how = _pdf_text(p)
             else: text, how = _xlsx_text(p), "xlsx"
+            if ext == ".pdf": text = _fix_dir(text)
             num, snip = _case_from_text(text)
             if num: base, src = a.prefix + num, "case number"
             else:
@@ -1120,6 +1121,111 @@ def cmd_pdfstat(a):
     print(f"PDF files: {len(files)}   sampled: {len(sample)}\n  " + "\n  ".join(f"{k}: {v}" for k, v in cnt.most_common()) + "\n")
     for l in lines: print(l)
 
+def _find_tesseract():
+    import shutil as _sh
+    t = _sh.which("tesseract")
+    if t: return t
+    for c in (r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"):
+        if os.path.exists(c): return c
+    return None
+
+_STOP_LINES = ("وزاره", "دوله", "بسم الله", "الرحمن", "المملكه", "جمهوريه", "ختم", "صوره")
+
+def _ocr_first_page(pdf, tess, dpi=150):
+    try: import pymupdf
+    except ImportError: import fitz as pymupdf
+    import subprocess, tempfile
+    doc = pymupdf.open(pdf)
+    if doc.page_count == 0: return ""
+    pix = doc[0].get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY)
+    doc.close()
+    with tempfile.TemporaryDirectory() as td:
+        img = os.path.join(td, "p.png"); pix.save(img)
+        r = subprocess.run([tess, img, "stdout", "-l", "ara+eng", "--psm", "3"], capture_output=True, timeout=180)
+    return r.stdout.decode("utf-8", "ignore")
+
+def _fix_dir(text):
+    """OCR/PDF text sometimes comes back in visual (reversed) order; put Arabic lines back in reading order."""
+    out = []
+    for ln in text.splitlines():
+        toks = ln.split()
+        ar = [t for t in toks if _AR.search(t)]
+        if len(ar) >= 2:
+            fwd = sum(1 for t in ar if _nrm(t).startswith(("ال", "وال", "بال", "لل", "في", "من", "علي", "الي")))
+            rev = sum(1 for t in ar if _nrm(t).endswith(("لا", "ةيف", "نم", "ىلع")))
+            if rev > fwd:
+                ln = " ".join(t if re.fullmatch(r"[\d/.\-:()]+", t) else t[::-1] for t in reversed(toks))
+        out.append(ln)
+    return "\n".join(out)
+
+_OCR_CASE_RE = re.compile(r"(?:القضي\w?|قضي\w?|الدعو[يه]\w?)[^\d]{0,25}?(\d{1,6}(?:\s*[/\\\-]\s*\d{2,4})?)")
+
+def _name_from_ocr(text, use_titles):
+    text = _fix_dir(text)
+    num, snip = _case_from_text(text)
+    if not num:                                   # OCR often misreads one letter of "القضية": match loosely
+        t = re.sub(r"\s+", " ", re.sub(r"[\u064B-\u065F]", "", text).translate(_AR_DIGITS).translate(_NORM))
+        m = _OCR_CASE_RE.search(t)
+        if m:
+            n = re.sub(r"\s*[/\\]\s*|\s*-\s*", "-", m.group(1).strip())
+            if not (len(n) < 2): num = n
+    if num: return "قضية " + num, "case number"
+    if use_titles:
+        for ln in text.splitlines():
+            ln = re.sub(r"\s+", " ", ln).strip()
+            if 12 <= len(ln) <= 80 and _ar_ratio(ln) > 0.8 and not any(w in _nrm(ln) for w in _STOP_LINES):
+                return sanitize(ln, 70), "title line"
+    return None, None
+
+def cmd_pdfocr(a):
+    """OCR page 1 of scanned PDFs and rename by case number (optionally by first Arabic title line)."""
+    tess = _find_tesseract()
+    if not tess: sys.exit("Tesseract OCR is not installed (needs the Arabic language data). Install it first, then run again.")
+    try:
+        try: import pymupdf
+        except ImportError: import fitz
+    except ImportError: sys.exit("PyMuPDF is not installed. Run:  py -m pip install pymupdf")
+    root = os.path.abspath(a.folder)
+    files = [p for p in iter_files(root) if p.lower().endswith(".pdf")]
+    cache_p = os.path.join(root, "ocr_cache.csv"); cache = {}
+    if a.apply and os.path.exists(cache_p):
+        with open(cache_p, newline="", encoding="utf-8-sig") as f:
+            for r in csv.reader(f):
+                if r: cache[r[0]] = r[1] if len(r) > 1 else ""
+    files = [p for p in files if p not in cache]
+    random.Random(a.seed).shuffle(files) if not a.apply else None
+    lim = a.limit if a.limit else (len(files) if a.all else 20)
+    files = files[:lim]
+    print(f"Tesseract: {tess}\nPDFs to process now: {len(files)}" + ("" if a.apply else "   (PREVIEW: nothing will be renamed)"), flush=True)
+    logp = os.path.join(root, f"rename_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    taken, done, named, t0 = set(), 0, 0, time.time()
+    lf = cf = None
+    if a.apply:
+        lf = open(logp, "w", newline="", encoding="utf-8-sig"); lw = csv.writer(lf); lw.writerow(["old_path", "new_path", "status", "source", "note"])
+        cf = open(cache_p, "a", newline="", encoding="utf-8-sig"); cw = csv.writer(cf)
+    for p in files:
+        done += 1
+        try: text = _ocr_first_page(p, tess)
+        except Exception as e: text = ""
+        name, src = _name_from_ocr(text, a.titles)
+        if not a.apply:
+            snip = re.sub(r"\s+", " ", text).strip()[:90]
+            print(f"{os.path.basename(p)}\n   OCR: {snip}\n   -> {name + '.pdf' + '   [' + src + ']' if name else '(kept: no case number found)'}", flush=True)
+        else:
+            if name:
+                try:
+                    new = os.path.join(os.path.dirname(p), unique(os.path.dirname(p), name, ".pdf", taken))
+                    if os.path.lexists(new): raise FileExistsError(new)
+                    os.rename(p, new); lw.writerow([p, new, "renamed", src, ""]); named += 1
+                except Exception as e: lw.writerow([p, "", "skipped", "", str(e)]); cw.writerow([p, ""])
+            else: cw.writerow([p, ""])
+            lf.flush(); cf.flush()
+            if done % 25 == 0:
+                rate = done / max(1, time.time() - t0); left = (len(files) - done) / max(rate, 1e-9)
+                print(f"  {done}/{len(files)}  renamed: {named}  about {left/3600:.1f} h left", flush=True)
+        if name: named += 0 if a.apply else 1
+    print(f"\nDone. Processed: {done}   {'Renamed' if a.apply else 'Would be renamed'}: {named}" + (f"\nUndo log: {logp}" if a.apply else ""))
+
 def cmd_undo(a):
     n = 0
     if os.path.isdir(a.log):                       # a folder: use its newest rename_log_*.csv
@@ -1214,6 +1320,9 @@ def main():
     p.add_argument("-n", type=int, default=25); p.set_defaults(fn=cmd_xlsxnames)
     p = sp.add_parser("pdfstat"); p.add_argument("folder"); p.add_argument("-n", type=int, default=200)
     p.add_argument("--seed", type=int, default=1); p.set_defaults(fn=cmd_pdfstat)
+    p = sp.add_parser("pdfocr"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
+    p.add_argument("--all", action="store_true"); p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--titles", action="store_true"); p.add_argument("--seed", type=int, default=1); p.set_defaults(fn=cmd_pdfocr)
     p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
