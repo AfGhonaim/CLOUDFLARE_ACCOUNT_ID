@@ -882,7 +882,7 @@ def _xlsx_text(path, limit=300):
         except KeyError: return ""
         return html.unescape("\n".join(re.findall(r"<t[^>]*>([^<]+)</t>", xml)[:limit]))
 
-def _pdf_text_std(path):
+def _pdf_text_std(path, content=False):
     """Best-effort PDF text with the standard library: Latin text and the /Title only."""
     with open(path, "rb") as f: data = f.read(6_000_000)
     out = []
@@ -893,6 +893,7 @@ def _pdf_text_std(path):
         t = re.sub(r"^(microsoft word|microsoft excel|adobe acrobat)\s*-\s*", "", t.strip(), flags=re.I)
         t = re.sub(r"\.(docx?|xlsx?|pptx?|txt|indd)$", "", t, flags=re.I)
         if len(t) >= 4 and not re.match(r"(untitled|document\d*|scan|new document|title)", t, re.I): out.append(t)
+    if not content: return "\n".join(out)          # built-in reader drops letters: use only the PDF's own title
     import base64
     for sm in re.finditer(rb"stream\r?\n(.*?)\r?\n?endstream", data, re.S):
         raw = sm.group(1)
@@ -922,7 +923,7 @@ def _pdf_text(path):
         raise
     except BaseException:                     # library missing or broken: fall back to the built-in reader
         pass
-    return _pdf_text_std(path), "std"
+    return _pdf_text_std(path, content=False), "std"
 
 def cmd_content(a):
     """Rename PDF and Excel (.xlsx) files in place by content: case number first, else title/first line."""
@@ -941,9 +942,6 @@ def cmd_content(a):
             num, snip = _case_from_text(text)
             if num: base, src = a.prefix + num, "case number"
             else:
-                if ext == ".pdf" and how == "std":          # built-in reader drops letters: trust only the PDF's own title
-                    mt = re.search(rb"/Title\s*\(", open(p, "rb").read(6_000_000))
-                    text = text.split("\n")[0] if (mt and text) else ""
                 t = first_line(text)
                 if ext == ".xlsx" and not t: t = office_title(p, ".xlsx")
                 if not t: keep += 1; continue
