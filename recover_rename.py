@@ -530,6 +530,76 @@ def cmd_media(a):
             lf.flush()
     print(f"Renamed: {ok}\nLeft as-is/skipped: {skipped}\nUndo log: {logp}")
 
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+_NORM = str.maketrans({"ة": "ه", "ى": "ي", "أ": "ا", "إ": "ا", "آ": "ا", "ـ": None})
+_CASE_KEY = r"(?:رقم\s*القضيه|القضيه\s*رقم|قضيه\s*رقم|رقم\s*الدعوي|الدعوي\s*رقم|رقم\s*الدعوه|الدعوه\s*رقم)"
+_CASE_RE = re.compile(_CASE_KEY + r"[\s:：\-–.()#،]{0,12}(\d+(?:\s*[/\\\-]\s*\d+){0,2})"
+                      r"(?:\s*(?:لسنه|لعام|عام|سنه|لسنة)\s*(\d{2,4}))?")
+
+def docx_text(path, limit=200000):
+    z = zipfile.ZipFile(path)
+    parts = ["word/document.xml"] + [n for n in z.namelist() if re.match(r"word/header\d*\.xml", n)]
+    out = []
+    for n in parts:
+        try: xml = z.read(n).decode("utf-8", "ignore")
+        except KeyError: continue
+        for para in re.findall(r"<w:p[ >].*?</w:p>", xml, re.S):
+            out.append("".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", para)))
+        if sum(map(len, out)) > limit: break
+    return " ".join(out)
+
+def case_number(path):
+    t = re.sub(r"[\u064B-\u065F]", "", docx_text(path)).translate(_AR_DIGITS).translate(_NORM)
+    t = re.sub(r"\s+", " ", t)
+    m = _CASE_RE.search(t)
+    if not m: return None, None
+    num = re.sub(r"\s*[/\\]\s*|\s*-\s*", "-", m.group(1).strip())
+    if m.group(2): num += "-" + m.group(2)
+    return num, t[max(0, m.start() - 10):m.end() + 5]
+
+def cmd_cases(a):
+    """Rename Word files to their case number (رقم القضية), in place."""
+    root = os.path.abspath(a.folder)
+    print("Scanning Word files (progress every 500)...", flush=True)
+    rows, taken, seen, nomatch = [], set(), 0, 0
+    for p in iter_files(root):
+        if not p.lower().endswith(".docx"): continue
+        seen += 1
+        if seen % 500 == 0: print(f"  checked {seen}, matched {len(rows)}", flush=True)
+        try:
+            num, snip = case_number(p)
+        except Exception as e:
+            rows.append((p, None, f"{type(e).__name__}: {e}")); continue
+        if not num: nomatch += 1; continue
+        base = a.prefix + num
+        stem = os.path.splitext(os.path.basename(p))[0]
+        if re.fullmatch(re.escape(base) + r"(_\d+)?", stem): taken.add(p.lower()); continue
+        name = unique(os.path.dirname(p), base, ".docx", taken)
+        rows.append((p, os.path.join(os.path.dirname(p), name), snip))
+    todo = [r for r in rows if r[1]]
+    print(f"\nWord files checked: {seen}\nCase number found: {len(todo)}   Not found (left unchanged): {nomatch}")
+    if not a.apply:
+        random.Random(1).shuffle(todo)
+        print(f"\nPREVIEW ONLY. {min(a.n, len(todo))} examples (old -> new  [text matched]):\n")
+        for old, new, snip in todo[:a.n]:
+            print(f"{os.path.relpath(old, root)}\n   -> {os.path.basename(new)}   [{snip}]")
+        if not (todo and sys.stdin.isatty()): return
+        if input(f"\nType YES (capitals) to rename all {len(todo)} files now: ").strip() != "YES":
+            print("Stopped. Nothing was renamed."); return
+    logp = os.path.join(root, f"rename_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    ok = skipped = 0
+    with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
+        w = csv.writer(lf); w.writerow(["old_path", "new_path", "status", "source", "note"])
+        for old, new, note in rows:
+            if not new: w.writerow([old, "", "skipped", "", note]); skipped += 1; continue
+            try:
+                if os.path.lexists(new): raise FileExistsError(new)
+                os.rename(old, new); w.writerow([old, new, "renamed", "case-number", ""]); ok += 1
+            except Exception as e:
+                w.writerow([old, "", "skipped", "", f"{type(e).__name__}: {e}"]); skipped += 1
+            lf.flush()
+    print(f"Renamed: {ok}\nSkipped: {skipped}\nUndo log: {logp}")
+
 def cmd_undo(a):
     n = 0
     with open(a.log, newline="", encoding="utf-8-sig") as f:
@@ -596,6 +666,8 @@ def main():
     p.add_argument("-n", type=int, default=20); p.set_defaults(fn=cmd_office)
     p = sp.add_parser("media"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
     p.add_argument("-n", type=int, default=20); p.set_defaults(fn=cmd_media)
+    p = sp.add_parser("cases"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
+    p.add_argument("-n", type=int, default=20); p.add_argument("--prefix", default="قضية "); p.set_defaults(fn=cmd_cases)
     p = sp.add_parser("undo"); p.add_argument("log"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
