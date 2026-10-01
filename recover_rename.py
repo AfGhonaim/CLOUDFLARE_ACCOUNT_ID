@@ -975,7 +975,7 @@ def cmd_content(a):
             lf.flush()
     print(f"Renamed: {ok}\nUndo log: {logp}")
 
-def _xlsx_peek(path, nrows=4, ncells=6):
+def _xlsx_peek(path, nrows=4, ncells=6, maxlen=40):
     z = zipfile.ZipFile(path)
     sheets = [html.unescape(m) for m in re.findall(r'<sheet [^>]*name="([^"]*)"', z.read("xl/workbook.xml").decode("utf-8", "ignore"))]
     try:
@@ -993,7 +993,7 @@ def _xlsx_peek(path, nrows=4, ncells=6):
             if 't="s"' in attrs and v and v.group(1).isdigit() and int(v.group(1)) < len(sst): vals.append(sst[int(v.group(1))])
             elif "inlineStr" in attrs: vals.append(html.unescape(re.sub(r"<[^>]+>", "", body)))
             elif v: vals.append(v.group(1))
-        vals = [re.sub(r"\s+", " ", x).strip()[:40] for x in vals if x.strip()]
+        vals = [re.sub(r"\s+", " ", x).strip()[:maxlen] for x in vals if x.strip()]
         if vals: rows.append(vals[:ncells])
         if len(rows) >= nrows: break
     return sheets, rows
@@ -1009,6 +1009,91 @@ def cmd_xlsxpeek(a):
         print(f"FILE: {os.path.basename(p)}\n  sheets: {sheets[:4]}")
         for r in rows: print("  | " + " | ".join(r))
         print()
+
+_AR = re.compile(r"[\u0600-\u06FF]")
+_GENERIC = re.compile(r"^(sheet\d*|page\b.*|part\b.*|new balance.*|item|description|unit|qty|quantity|amount|total|sr\.?|no\.?|date|ref.*|remarks?|s\.?n\.?|pay-?\d*|[\d\s.,/()-]+)$", re.I)
+_LABELS = [("project", ("اسم المشروع", "المشروع")), ("subject", ("الموضوع", "البيان")),
+           ("contractor", ("المقاول", "اسم المقاول")), ("contract", ("رقم العقد", "العقد"))]
+
+def _nrm(t):
+    return re.sub(r"[\u064B-\u065F]", "", t).translate(_NORM).strip()
+
+def _ar_ratio(t):
+    letters = [c for c in t if c.isalpha()]
+    return sum(1 for c in letters if _AR.match(c)) / len(letters) if letters else 0
+
+def _xlsx_arabic_name(path):
+    sheets, rows = _xlsx_peek(path, nrows=40, ncells=14, maxlen=90)
+    text = "\n".join(" ".join(r) for r in rows)
+    num, _ = _case_from_text(text)
+    if num: return "قضية " + num, "case number"
+    found = {}
+    for r in rows:
+        for i, cell in enumerate(r):
+            c = _nrm(cell)
+            for key, names in _LABELS:
+                if key in found: continue
+                for nm in names:
+                    nmn = _nrm(nm)
+                    if c.startswith(nmn) and len(c) <= len(nmn) + 80 and (":" in c or c.rstrip(": ") == nmn):
+                        val = cell.split(":", 1)[1].strip() if ":" in cell and len(cell.split(":", 1)[1].strip()) >= 3 else ""
+                        j = i + 1
+                        while not val and j < len(r):
+                            nxt = r[j].strip(); j += 1
+                            if len(nxt) >= 3 and not nxt.endswith(":") and not _GENERIC.match(nxt): val = nxt
+                        if val: found[key] = val
+                        break
+    parts = [found[k] for k in ("project", "subject") if k in found][:1]
+    if "contractor" in found: parts.append(found["contractor"])
+    if parts and any(_ar_ratio(x) > 0.5 for x in parts):
+        return sanitize(" - ".join(parts), 80), "labels"
+    best = ""
+    for r in rows:
+        for cell in r:
+            c = re.sub(r"\s+", " ", cell).strip()
+            if 6 <= len(c) <= 90 and _ar_ratio(c) > 0.6 and not c.endswith(":") and not _GENERIC.match(c):
+                if len(c) > len(best): best = c
+    if best: return sanitize(best, 80), "arabic title"
+    for sh in sheets:
+        if sh and _ar_ratio(sh) > 0.6 and not _GENERIC.match(sh): return sanitize(sh, 80), "sheet name"
+    return None, None
+
+def cmd_xlsxnames(a):
+    """Rename Excel files in place using Arabic-first, content-based names (case number, labeled fields, title)."""
+    root = os.path.abspath(a.folder)
+    print("Scanning Excel files (progress every 200)...", flush=True)
+    rows, taken, seen, keep, errs = [], set(), 0, 0, 0
+    for p in iter_files(root):
+        if not p.lower().endswith(".xlsx"): continue
+        seen += 1
+        if seen % 200 == 0: print(f"  checked {seen}, to rename {len(rows)}", flush=True)
+        try: name, src = _xlsx_arabic_name(p)
+        except Exception: errs += 1; continue
+        if not name: keep += 1; continue
+        stem = os.path.splitext(os.path.basename(p))[0]
+        if re.fullmatch(re.escape(name) + r"(_\d+)?", stem): taken.add(p.lower()); continue
+        rows.append((p, os.path.join(os.path.dirname(p), unique(os.path.dirname(p), name, ".xlsx", taken)), src))
+    by = collections.Counter(r[2] for r in rows)
+    print(f"\nExcel files: {seen}\nWill be renamed: {len(rows)}  {dict(by)}\nNo Arabic title found (left unchanged): {keep}   Errors: {errs}")
+    if not a.apply:
+        random.Random(1).shuffle(rows)
+        print(f"\nPREVIEW ONLY. {min(a.n, len(rows))} examples:\n")
+        for old, new, src in rows[:a.n]: print(f"{os.path.basename(old)}\n   -> {os.path.basename(new)}   [{src}]")
+        if not (rows and sys.stdin.isatty()): return
+        if input(f"\nType YES (capitals) to rename all {len(rows)} files now: ").strip() != "YES":
+            print("Stopped. Nothing was renamed."); return
+    logp = os.path.join(root, f"rename_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    ok = 0
+    with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
+        w = csv.writer(lf); w.writerow(["old_path", "new_path", "status", "source", "note"])
+        for old, new, src in rows:
+            try:
+                if os.path.lexists(new): raise FileExistsError(new)
+                os.rename(old, new); w.writerow([old, new, "renamed", src, ""]); ok += 1
+            except Exception as e:
+                w.writerow([old, "", "skipped", "", str(e)])
+            lf.flush()
+    print(f"Renamed: {ok}\nUndo log: {logp}")
 
 def cmd_undo(a):
     n = 0
@@ -1100,6 +1185,8 @@ def main():
     p.add_argument("-n", type=int, default=20); p.add_argument("--prefix", default="قضية "); p.set_defaults(fn=cmd_content)
     p = sp.add_parser("xlsxpeek"); p.add_argument("folder"); p.add_argument("-n", type=int, default=12)
     p.add_argument("--seed", type=int, default=1); p.set_defaults(fn=cmd_xlsxpeek)
+    p = sp.add_parser("xlsxnames"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
+    p.add_argument("-n", type=int, default=25); p.set_defaults(fn=cmd_xlsxnames)
     p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
