@@ -651,6 +651,12 @@ def cmd_previews(a):
             if len(nocase) < 6:
                 try: nocase.append((png, re.sub(r"\s+", " ", docx_text(src))[:160]))
                 except Exception: pass
+            if a.unknown:
+                orig = re.sub(r"\.docx\.png$", "", png, flags=re.I)
+                ubase = a.unknown if a.plain else f"{a.unknown} - {orig}"
+                ubase = ubase[:150]
+                if png[:-4] == ubase or re.fullmatch(re.escape(ubase) + r"_\d+", png[:-4]): continue
+                rows.append((os.path.join(pdir, png), os.path.join(pdir, unique(pdir, ubase, ".png", taken)), "no case number"))
             continue
         base = a.prefix + num
         if re.fullmatch(re.escape(base) + r"_\d+|" + re.escape(base), png[:-4]): continue
@@ -748,7 +754,10 @@ def main():
     p.add_argument("-n", type=int, default=20); p.add_argument("--prefix", default="قضية "); p.set_defaults(fn=cmd_cases)
     p = sp.add_parser("previews"); p.add_argument("previews"); p.add_argument("docx_root")
     p.add_argument("--apply", action="store_true"); p.add_argument("-n", type=int, default=20)
-    p.add_argument("--prefix", default="قضية "); p.set_defaults(fn=cmd_previews)
+    p.add_argument("--prefix", default="قضية ")
+    p.add_argument("--unknown", default="", help="name for pictures with no case number, e.g. 'قضية رقم ؟'")
+    p.add_argument("--plain", action="store_true", help="with --unknown: do not append the old title")
+    p.set_defaults(fn=cmd_previews)
     p = sp.add_parser("undo"); p.add_argument("log"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
