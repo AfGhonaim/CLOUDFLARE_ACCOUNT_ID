@@ -1180,8 +1180,9 @@ def _name_from_ocr(text, use_titles):
     if use_titles:
         for ln in text.splitlines():
             ln = re.sub(r"\s+", " ", ln).strip()
-            if 12 <= len(ln) <= 80 and _ar_ratio(ln) > 0.8 and not any(w in _nrm(ln) for w in _STOP_LINES):
-                return sanitize(ln, 70), "title line"
+            words = [w for w in ln.split() if len(w) >= 2 and _ar_ratio(w) > 0.8]
+            if 8 <= len(ln) <= 90 and len(words) >= 2 and _ar_ratio(ln) > 0.8 and not any(w in _nrm(ln) for w in _STOP_LINES):
+                return sanitize(" ".join(words[:10]), 70), "title line"
     return None, None
 
 def cmd_pdfocr(a):
@@ -1217,7 +1218,7 @@ def cmd_pdfocr(a):
     with ProcessPoolExecutor(max_workers=workers) as ex:
         for p, text in ex.map(_ocr_task, jobs, chunksize=2):
             done += 1
-            name, src = _name_from_ocr(text, a.titles)
+            name, src = _name_from_ocr(text, not a.no_titles)
             if not a.apply:
                 snip = re.sub(r"\s+", " ", text).strip()[:90]
                 print(f"{os.path.basename(p)}\n   OCR: {snip}\n   -> {name + '.pdf' + '   [' + src + ']' if name else '(kept: no case number found)'}", flush=True)
@@ -1332,7 +1333,8 @@ def main():
     p.add_argument("--seed", type=int, default=1); p.set_defaults(fn=cmd_pdfstat)
     p = sp.add_parser("pdfocr"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
     p.add_argument("--all", action="store_true"); p.add_argument("--limit", type=int, default=0)
-    p.add_argument("--titles", action="store_true"); p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--no-titles", action="store_true", help="only rename when a case number is found")
+    p.add_argument("--seed", type=int, default=1)
     p.add_argument("--workers", type=int, default=0); p.add_argument("--dpi", type=int, default=120)
     p.add_argument("--top", type=float, default=0.5, help="fraction of the page height to read, from the top"); p.set_defaults(fn=cmd_pdfocr)
     p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
