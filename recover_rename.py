@@ -532,8 +532,8 @@ def cmd_media(a):
 
 _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 _NORM = str.maketrans({"ة": "ه", "ى": "ي", "أ": "ا", "إ": "ا", "آ": "ا", "ـ": None})
-_CASE_KEY = r"(?:رقم\s*القضيه|القضيه\s*رقم|قضيه\s*رقم|رقم\s*الدعوي|الدعوي\s*رقم|رقم\s*الدعوه|الدعوه\s*رقم)"
-_CASE_RE = re.compile(_CASE_KEY + r"[\s:：\-–.()#،]{0,12}(\d+(?:\s*[/\\\-]\s*\d+){0,2})"
+_CASE_KEY = r"(?:القضيه|قضيه|الدعوي|الدعوه)"
+_CASE_RE = re.compile(_CASE_KEY + r"[^\d]{0,25}?(\d+(?:\s*[/\\\-]\s*\d+){0,2})"
                       r"(?:\s*(?:لسنه|لعام|عام|سنه|لسنة)\s*(\d{2,4}))?")
 
 def docx_text(path, limit=200000):
@@ -561,7 +561,7 @@ def cmd_cases(a):
     """Rename Word files to their case number (رقم القضية), in place."""
     root = os.path.abspath(a.folder)
     print("Scanning Word files (progress every 500)...", flush=True)
-    rows, taken, seen, nomatch = [], set(), 0, 0
+    rows, taken, seen, nomatch, already = [], set(), 0, 0, 0
     errs, samples, qcontext = collections.Counter(), [], []
     for p in iter_files(root):
         if not p.lower().endswith(".docx"): continue
@@ -582,11 +582,11 @@ def cmd_cases(a):
             continue
         base = a.prefix + num
         stem = os.path.splitext(os.path.basename(p))[0]
-        if re.fullmatch(re.escape(base) + r"(_\d+)?", stem): taken.add(p.lower()); continue
+        if re.fullmatch(re.escape(base) + r"(_\d+)?", stem): taken.add(p.lower()); already += 1; continue
         name = unique(os.path.dirname(p), base, ".docx", taken)
         rows.append((p, os.path.join(os.path.dirname(p), name), snip))
     todo = [r for r in rows if r[1]]
-    print(f"\nWord files checked: {seen}\nCase number found: {len(todo)}   Not found (left unchanged): {nomatch}   Errors: {sum(errs.values())}")
+    print(f"\nWord files checked: {seen}\nCase number found: {len(todo)}   Not found (left unchanged): {nomatch}   Already named: {already}   Errors: {sum(errs.values())}")
     for k, v in errs.most_common(4): print(f"  error x{v}: {k}")
     if not todo:
         print("\n--- DIAGNOSTIC: text from files with no match ---")
