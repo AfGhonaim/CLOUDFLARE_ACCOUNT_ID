@@ -793,6 +793,14 @@ def cmd_thumbs(a):
     print("Linking pictures to Word files...", flush=True)
     pairs = _picture_map(pdir, root)
     print(f"  linked: {len(pairs)}", flush=True)
+    allpng = [f for f in os.listdir(pdir) if f.lower().endswith(".png")]
+    linked_png = {os.path.basename(pg) for _, pg in pairs}
+    alldocx = [q for q in iter_files(root) if q.lower().endswith(".docx")]
+    linked_doc = {d for d, _ in pairs}
+    logs = [f for f in os.listdir(root) if f.startswith("rename_log_") and f.endswith(".csv")]
+    print(f"  pictures: {len(allpng)}  not linked: {len(allpng)-len(linked_png)}   Word files: {len(alldocx)}  without picture: {len(alldocx)-len(linked_doc)}   rename logs read: {len(logs)}")
+    for n_ in [f for f in allpng if f not in linked_png][:4]: print("   picture not linked:", n_)
+    for q in [q for q in alldocx if q not in linked_doc][:4]: print("   Word file without picture:", os.path.basename(q))
     if not a.all: pairs = pairs[:a.limit]; print(f"TEST MODE: only the first {len(pairs)} files. Add --all for everything.")
     jdir = os.path.join(os.environ.get("TEMP", pdir), "thumbs_jpg"); os.makedirs(jdir, exist_ok=True)
     mp = os.path.join(jdir, "map.csv")
