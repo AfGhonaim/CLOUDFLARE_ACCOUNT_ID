@@ -941,6 +941,9 @@ def cmd_content(a):
             num, snip = _case_from_text(text)
             if num: base, src = a.prefix + num, "case number"
             else:
+                if ext == ".pdf" and how == "std":          # built-in reader drops letters: trust only the PDF's own title
+                    mt = re.search(rb"/Title\s*\(", open(p, "rb").read(6_000_000))
+                    text = text.split("\n")[0] if (mt and text) else ""
                 t = first_line(text)
                 if ext == ".xlsx" and not t: t = office_title(p, ".xlsx")
                 if not t: keep += 1; continue
@@ -979,6 +982,7 @@ def cmd_undo(a):
     with open(a.log, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             if r["status"] != "renamed": continue
+            if a.ext and not r["new_path"].lower().endswith(a.ext.lower()): continue
             if os.path.exists(r["new_path"]) and not os.path.lexists(r["old_path"]):
                 os.makedirs(os.path.dirname(r["old_path"]), exist_ok=True)
                 os.rename(r["new_path"], r["old_path"]); n += 1
@@ -1055,7 +1059,7 @@ def main():
     p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_thumbs)
     p = sp.add_parser("content"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
     p.add_argument("-n", type=int, default=20); p.add_argument("--prefix", default="قضية "); p.set_defaults(fn=cmd_content)
-    p = sp.add_parser("undo"); p.add_argument("log"); p.set_defaults(fn=cmd_undo)
+    p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
 if __name__ == "__main__":
