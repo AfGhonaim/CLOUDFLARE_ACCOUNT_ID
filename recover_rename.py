@@ -11,7 +11,7 @@ Commands (nothing changes on disk except `backup`, `run`, `undo`):
   run     FOLDER            rename + sort into Photos/Videos/Music/Documents/Other
   undo    LOGFILE           reverse a run using its CSV log
 """
-import argparse, collections, csv, datetime as dt, os, random, re, shutil
+import argparse, collections, csv, datetime as dt, html, os, random, re, shutil, zlib
 import struct, sys, time, zipfile
 from xml.etree import ElementTree as ET
 
@@ -548,8 +548,8 @@ def docx_text(path, limit=200000):
         if sum(map(len, out)) > limit: break
     return " ".join(out)
 
-def case_number(path):
-    t = re.sub(r"[\u064B-\u065F]", "", docx_text(path)).translate(_AR_DIGITS).translate(_NORM)
+def _case_from_text(t):
+    t = re.sub(r"[\u064B-\u065F]", "", t).translate(_AR_DIGITS).translate(_NORM)
     t = re.sub(r"\s+", " ", t)
     for m in _CASE_RE.finditer(t):
         num = re.sub(r"\s*[/\\]\s*|\s*-\s*", "-", m.group(1).strip())
@@ -561,6 +561,9 @@ def case_number(path):
         if m.group(2): num += "-" + m.group(2)
         return num, t[max(0, m.start() - 10):m.end() + 5]
     return None, None
+
+def case_number(path):
+    return _case_from_text(docx_text(path))
 
 def cmd_cases(a):
     """Rename Word files to their case number (رقم القضية), in place."""
@@ -869,6 +872,108 @@ def cmd_thumbs(a):
             if i % 100 == 0: print(f"  embedded {i}/{len(todo)}  added: {cnt['added']}", flush=True)
     print(f"\nAdded thumbnails: {cnt['added']}   Already had: {cnt['already']}   Skipped/failed: {len(todo)-cnt['added']-cnt['already']}\nLog: {logp}")
 
+def _xlsx_text(path, limit=300):
+    z = zipfile.ZipFile(path)
+    try:
+        xml = z.read("xl/sharedStrings.xml").decode("utf-8", "ignore")
+        return html.unescape("\n".join(re.sub(r"<[^>]+>", "", m) for m in re.findall(r"<si>(.*?)</si>", xml, re.S)[:limit]))
+    except KeyError:                                   # some writers store text inline in the sheet
+        try: xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8", "ignore")
+        except KeyError: return ""
+        return html.unescape("\n".join(re.findall(r"<t[^>]*>([^<]+)</t>", xml)[:limit]))
+
+def _pdf_text_std(path):
+    """Best-effort PDF text with the standard library: Latin text and the /Title only."""
+    with open(path, "rb") as f: data = f.read(6_000_000)
+    out = []
+    m = re.search(rb"/Title\s*\((.*?)(?<!\\)\)", data, re.S)
+    if m:
+        raw = m.group(1)
+        t = raw[2:].decode("utf-16-be", "ignore") if raw[:2] == b"\xfe\xff" else raw.decode("latin-1", "ignore")
+        t = re.sub(r"^(microsoft word|microsoft excel|adobe acrobat)\s*-\s*", "", t.strip(), flags=re.I)
+        t = re.sub(r"\.(docx?|xlsx?|pptx?|txt|indd)$", "", t, flags=re.I)
+        if len(t) >= 4 and not re.match(r"(untitled|document\d*|scan|new document|title)", t, re.I): out.append(t)
+    import base64
+    for sm in re.finditer(rb"stream\r?\n(.*?)\r?\n?endstream", data, re.S):
+        raw = sm.group(1)
+        try: dec = zlib.decompress(raw)
+        except Exception:
+            try:
+                r85 = raw.strip()
+                r85 = r85[:-2] if r85.endswith(b"~>") else r85
+                dec = zlib.decompress(base64.a85decode(r85))
+            except Exception: dec = raw
+        if b"BT" not in dec: continue
+        for t1, t2 in re.findall(rb"\(((?:[^()\\]|\\.)*)\)\s*Tj|\[((?:[^\]])*)\]\s*TJ", dec, re.S):
+            parts = [t1] if t1 else re.findall(rb"\(((?:[^()\\]|\\.)*)\)", t2)
+            line = b"".join(parts).decode("latin-1", "ignore")
+            if line and sum(c.isascii() for c in line) >= 0.9 * len(line): out.append(line)
+        if sum(map(len, out)) > 4000: break
+    return "\n".join(out)
+
+def _pdf_text(path):
+    try:
+        import pypdf
+        r = pypdf.PdfReader(path)
+        if r.is_encrypted: r.decrypt("")
+        txt = "\n".join((pg.extract_text() or "") for pg in r.pages[:3])
+        if txt.strip(): return txt, "pypdf"
+    except KeyboardInterrupt:
+        raise
+    except BaseException:                     # library missing or broken: fall back to the built-in reader
+        pass
+    return _pdf_text_std(path), "std"
+
+def cmd_content(a):
+    """Rename PDF and Excel (.xlsx) files in place by content: case number first, else title/first line."""
+    root = os.path.abspath(a.folder)
+    print("Scanning (progress every 500 files)...", flush=True)
+    rows, taken, seen, found, keep, errs = [], set(), 0, 0, 0, collections.Counter()
+    for p in iter_files(root):
+        seen += 1
+        if seen % 500 == 0: print(f"  scanned {seen} files, PDF/Excel found: {found}, to rename: {len([r for r in rows if r[1]])}", flush=True)
+        try:
+            kind, ext = classify(p)
+            if ext not in (".pdf", ".xlsx"): continue
+            found += 1
+            if ext == ".pdf": text, how = _pdf_text(p)
+            else: text, how = _xlsx_text(p), "xlsx"
+            num, snip = _case_from_text(text)
+            if num: base, src = a.prefix + num, "case number"
+            else:
+                t = first_line(text)
+                if ext == ".xlsx" and not t: t = office_title(p, ".xlsx")
+                if not t: keep += 1; continue
+                base, src = t, f"title ({how})"
+            stem = os.path.splitext(os.path.basename(p))[0]
+            if re.fullmatch(re.escape(base) + r"(_\d+)?", stem): taken.add(p.lower()); continue
+            name = unique(os.path.dirname(p), base, ext, taken)
+            rows.append((p, os.path.join(os.path.dirname(p), name), src))
+        except Exception as e:
+            errs[type(e).__name__] += 1
+    todo = [r for r in rows if r[1]]
+    by = collections.Counter(r[2] for r in todo)
+    print(f"\nPDF/Excel files found: {found}\nWill be renamed: {len(todo)}  {dict(by)}\nNo readable content (left unchanged): {keep}   Errors: {sum(errs.values())}")
+    if not a.apply:
+        random.Random(1).shuffle(todo)
+        print(f"\nPREVIEW ONLY. {min(a.n, len(todo))} examples:\n")
+        for old, new, src in todo[:a.n]: print(f"{os.path.relpath(old, root)}\n   -> {os.path.basename(new)}   [{src}]")
+        if not (todo and sys.stdin.isatty()): return
+        if input(f"\nType YES (capitals) to rename all {len(todo)} files now: ").strip() != "YES":
+            print("Stopped. Nothing was renamed."); return
+    logp = os.path.join(root, f"rename_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    ok = 0
+    with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
+        w = csv.writer(lf); w.writerow(["old_path", "new_path", "status", "source", "note"])
+        for old, new, src in todo:
+            try:
+                if os.path.lexists(new): raise FileExistsError(new)
+                os.rename(old, new); w.writerow([old, new, "renamed", src, ""]); ok += 1
+            except Exception as e:
+                w.writerow([old, "", "skipped", "", str(e)])
+            lf.flush()
+    print(f"Renamed: {ok}\nUndo log: {logp}")
+
 def cmd_undo(a):
     n = 0
     with open(a.log, newline="", encoding="utf-8-sig") as f:
@@ -948,6 +1053,8 @@ def main():
     p.add_argument("--all", action="store_true"); p.add_argument("--limit", type=int, default=3)
     p.add_argument("--skip-convert", action="store_true"); p.add_argument("--from-pictures", action="store_true")
     p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_thumbs)
+    p = sp.add_parser("content"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
+    p.add_argument("-n", type=int, default=20); p.add_argument("--prefix", default="قضية "); p.set_defaults(fn=cmd_content)
     p = sp.add_parser("undo"); p.add_argument("log"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
