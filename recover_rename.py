@@ -975,6 +975,41 @@ def cmd_content(a):
             lf.flush()
     print(f"Renamed: {ok}\nUndo log: {logp}")
 
+def _xlsx_peek(path, nrows=4, ncells=6):
+    z = zipfile.ZipFile(path)
+    sheets = [html.unescape(m) for m in re.findall(r'<sheet [^>]*name="([^"]*)"', z.read("xl/workbook.xml").decode("utf-8", "ignore"))]
+    try:
+        sst = [html.unescape(re.sub(r"<[^>]+>", "", m)) for m in re.findall(r"<si>(.*?)</si>", z.read("xl/sharedStrings.xml").decode("utf-8", "ignore"), re.S)]
+    except KeyError:
+        sst = []
+    names = [n for n in z.namelist() if n.startswith("xl/worksheets/sheet")]
+    xml = z.read(sorted(names)[0]).decode("utf-8", "ignore") if names else ""
+    rows = []
+    for rm in re.finditer(r"<row\b[^>]*>(.*?)</row>", xml, re.S):
+        vals = []
+        for cm in re.finditer(r"<c\b([^>]*?)(?:/>|>(.*?)</c>)", rm.group(1), re.S):
+            attrs, body = cm.group(1), cm.group(2) or ""
+            v = re.search(r"<v>(.*?)</v>", body, re.S)
+            if 't="s"' in attrs and v and v.group(1).isdigit() and int(v.group(1)) < len(sst): vals.append(sst[int(v.group(1))])
+            elif "inlineStr" in attrs: vals.append(html.unescape(re.sub(r"<[^>]+>", "", body)))
+            elif v: vals.append(v.group(1))
+        vals = [re.sub(r"\s+", " ", x).strip()[:40] for x in vals if x.strip()]
+        if vals: rows.append(vals[:ncells])
+        if len(rows) >= nrows: break
+    return sheets, rows
+
+def cmd_xlsxpeek(a):
+    root = os.path.abspath(a.folder)
+    files = [p for p in iter_files(root) if p.lower().endswith(".xlsx")]
+    random.Random(a.seed).shuffle(files)
+    print(f"{len(files)} Excel files. Showing {min(a.n, len(files))} random ones (read-only):\n")
+    for p in files[:a.n]:
+        try: sheets, rows = _xlsx_peek(p)
+        except Exception as e: print(f"{os.path.basename(p)}  [unreadable: {e}]\n"); continue
+        print(f"FILE: {os.path.basename(p)}\n  sheets: {sheets[:4]}")
+        for r in rows: print("  | " + " | ".join(r))
+        print()
+
 def cmd_undo(a):
     n = 0
     if os.path.isdir(a.log):                       # a folder: use its newest rename_log_*.csv
@@ -1063,6 +1098,8 @@ def main():
     p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_thumbs)
     p = sp.add_parser("content"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
     p.add_argument("-n", type=int, default=20); p.add_argument("--prefix", default="قضية "); p.set_defaults(fn=cmd_content)
+    p = sp.add_parser("xlsxpeek"); p.add_argument("folder"); p.add_argument("-n", type=int, default=12)
+    p.add_argument("--seed", type=int, default=1); p.set_defaults(fn=cmd_xlsxpeek)
     p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
