@@ -977,6 +977,10 @@ def cmd_content(a):
 
 def cmd_undo(a):
     n = 0
+    if os.path.isdir(a.log):                       # a folder: use its newest rename_log_*.csv
+        logs = sorted(f for f in os.listdir(a.log) if f.startswith("rename_log_") and f.endswith(".csv"))
+        if not logs: sys.exit(f"No rename_log_*.csv found in {a.log}")
+        a.log = os.path.join(a.log, logs[-1]); print(f"Using log: {a.log}")
     with open(a.log, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             if r["status"] != "renamed": continue
