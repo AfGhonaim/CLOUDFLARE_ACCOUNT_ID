@@ -635,7 +635,10 @@ def cmd_previews(a):
     print("Step 2/3: reading earlier rename logs...", flush=True)
     moved = {}                                  # follow earlier renames recorded in logs
     existing = set(cur.values())
-    for lg in sorted(f for f in os.listdir(root) if f.startswith("rename_log_") and f.endswith(".csv")):
+    logs = [] if a.no_logs else sorted(f for f in os.listdir(root) if f.startswith("rename_log_") and f.endswith(".csv"))
+    if a.no_logs: print("  (skipped on request)", flush=True)
+    for lg in logs:
+        print(f"  reading {lg} ...", flush=True)
         with open(os.path.join(root, lg), newline="", encoding="utf-8-sig") as f:
             n = 0
             for r in csv.DictReader(f):
@@ -769,6 +772,7 @@ def main():
     p.add_argument("--prefix", default="قضية ")
     p.add_argument("--unknown", default="", help="name for pictures with no case number, e.g. 'قضية رقم ؟'")
     p.add_argument("--plain", action="store_true", help="with --unknown: do not append the old title")
+    p.add_argument("--no-logs", action="store_true", help="skip reading earlier rename logs")
     p.set_defaults(fn=cmd_previews)
     p = sp.add_parser("undo"); p.add_argument("log"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
