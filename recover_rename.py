@@ -1194,12 +1194,17 @@ def cmd_pdfocr(a):
         except ImportError: import fitz
     except ImportError: sys.exit("PyMuPDF is not installed. Run:  py -m pip install pymupdf")
     import subprocess
+    mine = os.path.join(os.path.expanduser("~"), "tessdata")           # user-writable language folder (no admin needed)
+    if os.path.exists(os.path.join(mine, "ara.traineddata")):
+        os.environ["TESSDATA_PREFIX"] = mine
+        print(f"Using language files from {mine}", flush=True)
     try:
-        langs = subprocess.run([tess, "--list-langs"], capture_output=True).stdout.decode("utf-8", "ignore").split()
+        out = subprocess.run([tess, "--list-langs"], capture_output=True).stdout.decode("utf-8", "ignore").splitlines()
+        langs = [l.strip() for l in out[1:] if l.strip()]
     except Exception: langs = []
     if "ara" not in langs:
-        sys.exit("Tesseract has NO Arabic language data (found: " + ", ".join(l for l in langs[1:] if l.isalpha()) + ").\n"
-                 "Install it, then run again. See the instructions I gave you for adding ara.traineddata.")
+        sys.exit("Tesseract has NO Arabic language data (it only has: " + ", ".join(langs) + ").\n"
+                 "Put ara.traineddata and eng.traineddata in the folder  " + mine + "  and run again.")
     root = os.path.abspath(a.folder)
     files = [p for p in iter_files(root) if p.lower().endswith(".pdf")]
     cache_p = os.path.join(root, "ocr_cache.csv"); cache = {}
