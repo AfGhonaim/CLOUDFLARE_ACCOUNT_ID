@@ -626,8 +626,13 @@ def cmd_previews(a):
     if a.unknown == "auto": a.unknown = "قضية رقم ؟"
     key = lambda rel: re.sub(r'[\\/:*?"<>|]', " - ", rel) + ".png"
     cur = {}                                    # preview-name -> current docx path
+    print("Step 1/3: listing Word files on the drive...", flush=True)
     for p in iter_files(root):
-        if p.lower().endswith(".docx"): cur[key(os.path.relpath(p, root))] = p
+        if p.lower().endswith(".docx"):
+            cur[key(os.path.relpath(p, root))] = p
+            if len(cur) % 500 == 0: print(f"  listed {len(cur)} Word files", flush=True)
+    print(f"  listed {len(cur)} Word files in total", flush=True)
+    print("Step 2/3: reading earlier rename logs...", flush=True)
     moved = {}                                  # follow earlier renames recorded in logs
     for lg in sorted(f for f in os.listdir(root) if f.startswith("rename_log_") and f.endswith(".csv")):
         with open(os.path.join(root, lg), newline="", encoding="utf-8-sig") as f:
@@ -639,10 +644,11 @@ def cmd_previews(a):
         if os.path.exists(d):
             cur.setdefault(key(os.path.relpath(rl, root)), d)
     rows, taken, keep, nodoc, seen, nocase = [], set(), 0, 0, 0, []
+    print("Step 3/3: reading each document's text (progress every 100)...", flush=True)
     for png in sorted(os.listdir(pdir)):
         if not png.lower().endswith(".png"): continue
         seen += 1
-        if seen % 500 == 0: print(f"  checked {seen}", flush=True)
+        if seen % 100 == 0: print(f"  checked {seen} pictures, to rename so far: {len(rows)}", flush=True)
         src = cur.get(png)
         if not src: nodoc += 1; continue
         try: num, snip = case_number(src)
