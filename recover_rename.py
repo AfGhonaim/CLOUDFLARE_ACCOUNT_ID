@@ -637,7 +637,7 @@ def cmd_previews(a):
         while d in moved and d != moved[d]: d = moved[d]
         if os.path.exists(d):
             cur.setdefault(key(os.path.relpath(rl, root)), d)
-    rows, taken, keep, nodoc, seen = [], set(), 0, 0, 0
+    rows, taken, keep, nodoc, seen, nocase = [], set(), 0, 0, 0, []
     for png in sorted(os.listdir(pdir)):
         if not png.lower().endswith(".png"): continue
         seen += 1
@@ -646,7 +646,12 @@ def cmd_previews(a):
         if not src: nodoc += 1; continue
         try: num, snip = case_number(src)
         except Exception: num = None
-        if not num: keep += 1; continue
+        if not num:
+            keep += 1
+            if len(nocase) < 6:
+                try: nocase.append((png, re.sub(r"\s+", " ", docx_text(src))[:160]))
+                except Exception: pass
+            continue
         base = a.prefix + num
         if re.fullmatch(re.escape(base) + r"_\d+|" + re.escape(base), png[:-4]): continue
         rows.append((os.path.join(pdir, png), os.path.join(pdir, unique(pdir, base, ".png", taken)), snip))
@@ -655,6 +660,9 @@ def cmd_previews(a):
         random.Random(1).shuffle(rows)
         print(f"\nPREVIEW ONLY. {min(a.n, len(rows))} examples:\n")
         for old, new, snip in rows[:a.n]: print(f"{os.path.basename(old)}\n   -> {os.path.basename(new)}   [{snip}]")
+        if nocase:
+            print("\n--- pictures with NO case number found (start of their text) ---")
+            for n_, t_ in nocase: print(f"{n_}\n   {t_}")
         if not (rows and sys.stdin.isatty()): return
         if input(f"\nType YES (capitals) to rename all {len(rows)} pictures now: ").strip() != "YES":
             print("Stopped. Nothing was renamed."); return
