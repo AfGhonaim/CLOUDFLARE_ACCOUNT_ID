@@ -562,22 +562,37 @@ def cmd_cases(a):
     root = os.path.abspath(a.folder)
     print("Scanning Word files (progress every 500)...", flush=True)
     rows, taken, seen, nomatch = [], set(), 0, 0
+    errs, samples, qcontext = collections.Counter(), [], []
     for p in iter_files(root):
         if not p.lower().endswith(".docx"): continue
         seen += 1
-        if seen % 500 == 0: print(f"  checked {seen}, matched {len(rows)}", flush=True)
+        if seen % 500 == 0: print(f"  checked {seen}, matched {len([r for r in rows if r[1]])}", flush=True)
         try:
             num, snip = case_number(p)
         except Exception as e:
+            errs[f"{type(e).__name__}: {str(e)[:60]}"] += 1
             rows.append((p, None, f"{type(e).__name__}: {e}")); continue
-        if not num: nomatch += 1; continue
+        if not num:
+            nomatch += 1
+            if len(samples) < 3 or len(qcontext) < 4:
+                t = re.sub(r"\s+", " ", docx_text(p))
+                if len(samples) < 3 and t.strip(): samples.append((p, t[:200]))
+                i = t.find("قض")
+                if i >= 0 and len(qcontext) < 4: qcontext.append((p, t[max(0, i - 40):i + 80]))
+            continue
         base = a.prefix + num
         stem = os.path.splitext(os.path.basename(p))[0]
         if re.fullmatch(re.escape(base) + r"(_\d+)?", stem): taken.add(p.lower()); continue
         name = unique(os.path.dirname(p), base, ".docx", taken)
         rows.append((p, os.path.join(os.path.dirname(p), name), snip))
     todo = [r for r in rows if r[1]]
-    print(f"\nWord files checked: {seen}\nCase number found: {len(todo)}   Not found (left unchanged): {nomatch}")
+    print(f"\nWord files checked: {seen}\nCase number found: {len(todo)}   Not found (left unchanged): {nomatch}   Errors: {sum(errs.values())}")
+    for k, v in errs.most_common(4): print(f"  error x{v}: {k}")
+    if not todo:
+        print("\n--- DIAGNOSTIC: text from files with no match ---")
+        for p, t in samples: print(f"{os.path.basename(p)}: {t}")
+        print("--- places where the word 'قض' appears ---")
+        for p, t in qcontext: print(f"{os.path.basename(p)}: ...{t}...")
     if not a.apply:
         random.Random(1).shuffle(todo)
         print(f"\nPREVIEW ONLY. {min(a.n, len(todo))} examples (old -> new  [text matched]):\n")
