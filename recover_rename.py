@@ -1129,7 +1129,7 @@ def _find_tesseract():
         if os.path.exists(c): return c
     return None
 
-_STOP_LINES = ("وزاره", "دوله", "بسم الله", "الرحمن", "المملكه", "جمهوريه", "ختم", "صوره")
+_STOP_LINES = ("وزار", "دول", "بسم", "الرحم", "المملك", "جمهور", "ختم", "صور", "لعدل", "العدل")
 
 def _ocr_first_page(pdf, tess, dpi=120, top=0.5):
     try: import pymupdf
