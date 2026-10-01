@@ -620,6 +620,56 @@ def cmd_cases(a):
             lf.flush()
     print(f"Renamed: {ok}\nSkipped: {skipped}\nUndo log: {logp}")
 
+def cmd_previews(a):
+    """Rename preview PNGs (made by word_previews.ps1) to the case number found in their Word file."""
+    pdir, root = os.path.abspath(a.previews), os.path.abspath(a.docx_root)
+    key = lambda rel: re.sub(r'[\\/:*?"<>|]', " - ", rel) + ".png"
+    cur = {}                                    # preview-name -> current docx path
+    for p in iter_files(root):
+        if p.lower().endswith(".docx"): cur[key(os.path.relpath(p, root))] = p
+    moved = {}                                  # follow earlier renames recorded in logs
+    for lg in sorted(f for f in os.listdir(root) if f.startswith("rename_log_") and f.endswith(".csv")):
+        with open(os.path.join(root, lg), newline="", encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                if r["status"] == "renamed": moved[r["old_path"]] = r["new_path"]
+    for rl in list(moved):                      # old name -> final name
+        d = moved[rl]
+        while d in moved and d != moved[d]: d = moved[d]
+        if os.path.exists(d):
+            cur.setdefault(key(os.path.relpath(rl, root)), d)
+    rows, taken, keep, nodoc, seen = [], set(), 0, 0, 0
+    for png in sorted(os.listdir(pdir)):
+        if not png.lower().endswith(".png"): continue
+        seen += 1
+        if seen % 500 == 0: print(f"  checked {seen}", flush=True)
+        src = cur.get(png)
+        if not src: nodoc += 1; continue
+        try: num, snip = case_number(src)
+        except Exception: num = None
+        if not num: keep += 1; continue
+        base = a.prefix + num
+        if re.fullmatch(re.escape(base) + r"_\d+|" + re.escape(base), png[:-4]): continue
+        rows.append((os.path.join(pdir, png), os.path.join(pdir, unique(pdir, base, ".png", taken)), snip))
+    print(f"\nPictures: {seen}\nWill be renamed by case number: {len(rows)}\nKept as they are (no case number): {keep}\nCould not match to a Word file: {nodoc}")
+    if not a.apply:
+        random.Random(1).shuffle(rows)
+        print(f"\nPREVIEW ONLY. {min(a.n, len(rows))} examples:\n")
+        for old, new, snip in rows[:a.n]: print(f"{os.path.basename(old)}\n   -> {os.path.basename(new)}   [{snip}]")
+        if not (rows and sys.stdin.isatty()): return
+        if input(f"\nType YES (capitals) to rename all {len(rows)} pictures now: ").strip() != "YES":
+            print("Stopped. Nothing was renamed."); return
+    logp = os.path.join(pdir, f"rename_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    ok = 0
+    with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
+        w = csv.writer(lf); w.writerow(["old_path", "new_path", "status", "source", "note"])
+        for old, new, _ in rows:
+            try:
+                if os.path.lexists(new): raise FileExistsError(new)
+                os.rename(old, new); w.writerow([old, new, "renamed", "case-number", ""]); ok += 1
+            except Exception as e:
+                w.writerow([old, "", "skipped", "", str(e)])
+    print(f"Renamed: {ok}\nUndo log: {logp}")
+
 def cmd_undo(a):
     n = 0
     with open(a.log, newline="", encoding="utf-8-sig") as f:
@@ -688,6 +738,9 @@ def main():
     p.add_argument("-n", type=int, default=20); p.set_defaults(fn=cmd_media)
     p = sp.add_parser("cases"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
     p.add_argument("-n", type=int, default=20); p.add_argument("--prefix", default="قضية "); p.set_defaults(fn=cmd_cases)
+    p = sp.add_parser("previews"); p.add_argument("previews"); p.add_argument("docx_root")
+    p.add_argument("--apply", action="store_true"); p.add_argument("-n", type=int, default=20)
+    p.add_argument("--prefix", default="قضية "); p.set_defaults(fn=cmd_previews)
     p = sp.add_parser("undo"); p.add_argument("log"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
