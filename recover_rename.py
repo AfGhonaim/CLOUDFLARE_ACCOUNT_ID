@@ -551,11 +551,16 @@ def docx_text(path, limit=200000):
 def case_number(path):
     t = re.sub(r"[\u064B-\u065F]", "", docx_text(path)).translate(_AR_DIGITS).translate(_NORM)
     t = re.sub(r"\s+", " ", t)
-    m = _CASE_RE.search(t)
-    if not m: return None, None
-    num = re.sub(r"\s*[/\\]\s*|\s*-\s*", "-", m.group(1).strip())
-    if m.group(2): num += "-" + m.group(2)
-    return num, t[max(0, m.start() - 10):m.end() + 5]
+    for m in _CASE_RE.finditer(t):
+        num = re.sub(r"\s*[/\\]\s*|\s*-\s*", "-", m.group(1).strip())
+        parts = num.split("-")
+        if len(parts) == 3 and 1 <= int(parts[0]) <= 31 and 1 <= int(parts[1]) <= 12 and len(parts[2]) == 4:
+            continue                      # looks like a date (27/3/2014), not a case number
+        if len(parts) == 1 and not m.group(2) and len(parts[0]) < 2:
+            continue                      # lone single digit
+        if m.group(2): num += "-" + m.group(2)
+        return num, t[max(0, m.start() - 10):m.end() + 5]
+    return None, None
 
 def cmd_cases(a):
     """Rename Word files to their case number (رقم القضية), in place."""
