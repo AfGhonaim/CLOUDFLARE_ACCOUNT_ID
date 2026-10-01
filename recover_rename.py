@@ -983,6 +983,8 @@ def cmd_undo(a):
         a.log = os.path.join(a.log, logs[-1]); print(f"Using log: {a.log}")
     with open(a.log, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
+            seen_rows = locals().get("seen_rows", 0) + 1
+            if seen_rows % 500 == 0: print(f"  checked {seen_rows} log rows, restored {n}", flush=True)
             if r["status"] != "renamed": continue
             if a.ext and not r["new_path"].lower().endswith(a.ext.lower()): continue
             if os.path.exists(r["new_path"]) and not os.path.lexists(r["old_path"]):
