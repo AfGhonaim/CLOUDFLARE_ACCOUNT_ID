@@ -623,6 +623,7 @@ def cmd_cases(a):
 def cmd_previews(a):
     """Rename preview PNGs (made by word_previews.ps1) to the case number found in their Word file."""
     pdir, root = os.path.abspath(a.previews), os.path.abspath(a.docx_root)
+    if a.unknown == "auto": a.unknown = "قضية رقم ؟"
     key = lambda rel: re.sub(r'[\\/:*?"<>|]', " - ", rel) + ".png"
     cur = {}                                    # preview-name -> current docx path
     for p in iter_files(root):
