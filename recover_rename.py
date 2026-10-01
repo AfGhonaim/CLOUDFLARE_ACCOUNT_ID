@@ -1171,6 +1171,9 @@ _DOC_WORDS = ("مذكره", "صحيفه", "حكم", "اعلان", "محضر", "�
               "اقرار", "اخطار", "فاتوره", "كشف", "قرار", "مناقصه", "ترخيص", "تفويض", "مستخلص", "طلب", "عريضه", "استئناف",
               "تظلم", "طعن", "دعوي", "محضر", "ايصال", "شيك", "سند", "بلاغ", "شكوي", "عرض سعر", "تعهد", "اتفاقيه", "ملحق")
 
+_FILLER = ("رقم", "تاريخ", "بتاريخ", "السيد", "السيده", "الاستاذ", "مقدم", "مقدمه", "الي", "علي", "الى", "من", "في", "ذات")
+_GENERIC_TYPES = ("عقد", "كتاب", "طلب", "قرار", "سند", "حكم", "بلاغ", "ملحق", "تقرير", "خطاب", "ايصال", "شيك", "كشف")
+
 def _clean_tok(t):
     return len(t) >= 3 and _ar_ratio(t) > 0.9
 
@@ -1183,10 +1186,17 @@ def _doc_type(text):
         for i, t in enumerate(nt):
             if any(t == w or (t.startswith(w) and len(t) <= len(w) + 3) for w in _DOC_WORDS) and _ar_ratio(toks[i]) > 0.9 and len(t) >= 3:
                 phrase = [toks[i]]
-                for x in toks[i + 1:i + 4]:
-                    if _clean_tok(x) and not any(sw in _nrm(x) for sw in _STOP_LINES): phrase.append(x)
+                for x, nx in zip(toks[i + 1:i + 4], nt[i + 1:i + 4]):
+                    if _clean_tok(x) and nx not in _FILLER and not any(sw in nx for sw in _STOP_LINES): phrase.append(x)
                     else: break
-                return sanitize(" ".join(phrase), 50)
+                return sanitize(" ".join(phrase), 50), len(phrase), nt[i]
+    return None, 0, ""
+
+def _find_date(t):
+    for m in re.finditer(r"(\d{4})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{1,2})|(\d{1,2})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{4})", t):
+        g = m.groups()
+        y, mo, d = (int(g[0]), int(g[1]), int(g[2])) if g[0] else (int(g[5]), int(g[4]), int(g[3]))
+        if 1990 <= y <= 2035 and 1 <= mo <= 12 and 1 <= d <= 31: return f"{y}-{mo:02d}-{d:02d}"
     return None
 
 def _name_from_ocr(text, use_titles):
@@ -1198,9 +1208,12 @@ def _name_from_ocr(text, use_titles):
         yr = m.group(2) or m.group(3)
         num = m.group(1) + ("-" + yr if yr else "")
         if len(m.group(1)) < 2 and not yr: num = None
-    dtype = _doc_type(text) if use_titles else None
+    date = _find_date(t)
+    dtype, nwords, kw = _doc_type(text) if use_titles else (None, 0, "")
+    if dtype and nwords == 1 and kw in _GENERIC_TYPES and not (num or date): dtype = None   # a bare "كتاب"/"عقد" says nothing
     if dtype and num: return f"{dtype} - قضية {num}", "type + case number"
     if num: return "قضية " + num, "case number"
+    if dtype and date: return f"{dtype} {date}", "type + date"
     if dtype: return dtype, "document type"
     if use_titles:
         for ln in text.splitlines():
