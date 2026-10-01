@@ -634,15 +634,20 @@ def cmd_previews(a):
     print(f"  listed {len(cur)} Word files in total", flush=True)
     print("Step 2/3: reading earlier rename logs...", flush=True)
     moved = {}                                  # follow earlier renames recorded in logs
+    existing = set(cur.values())
     for lg in sorted(f for f in os.listdir(root) if f.startswith("rename_log_") and f.endswith(".csv")):
         with open(os.path.join(root, lg), newline="", encoding="utf-8-sig") as f:
+            n = 0
             for r in csv.DictReader(f):
-                if r["status"] == "renamed": moved[r["old_path"]] = r["new_path"]
-    for rl in list(moved):                      # old name -> final name
-        d = moved[rl]
-        while d in moved and d != moved[d]: d = moved[d]
-        if os.path.exists(d):
-            cur.setdefault(key(os.path.relpath(rl, root)), d)
+                if r["status"] == "renamed": moved[r["old_path"]] = r["new_path"]; n += 1
+        print(f"  log {lg}: {n} renames", flush=True)
+    resolved = 0
+    for rl in list(moved):                      # old name -> final name (guarded against loops)
+        d, hops = moved[rl], 0
+        while d in moved and d != moved[d] and hops < 20: d = moved[d]; hops += 1
+        if d in existing:
+            cur.setdefault(key(os.path.relpath(rl, root)), d); resolved += 1
+    print(f"  matched {resolved} old names to current files", flush=True)
     rows, taken, keep, nodoc, seen, nocase = [], set(), 0, 0, 0, []
     print("Step 3/3: reading each document's text (progress every 100)...", flush=True)
     for png in sorted(os.listdir(pdir)):
