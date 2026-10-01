@@ -1095,6 +1095,31 @@ def cmd_xlsxnames(a):
             lf.flush()
     print(f"Renamed: {ok}\nUndo log: {logp}")
 
+def cmd_pdfstat(a):
+    """Read-only: how many PDFs hold real text versus scanned images (approximate, built-in reader)."""
+    root = os.path.abspath(a.folder)
+    files = [p for p in iter_files(root) if p.lower().endswith(".pdf")]
+    random.Random(a.seed).shuffle(files)
+    sample = files[:a.n]
+    cnt = collections.Counter(); lines = []
+    for p in sample:
+        try:
+            with open(p, "rb") as f: d = f.read(4_000_000)
+            blob = d
+            for m in re.finditer(rb"stream\r?\n(.*?)\r?\n?endstream", d, re.S):
+                if len(m.group(1)) < 400_000:
+                    try: blob += zlib.decompress(m.group(1))[:400_000]
+                    except Exception: pass
+            fonts = len(re.findall(rb"/Type\s*/Font\b", blob)); imgs = len(re.findall(rb"/Subtype\s*/Image", blob))
+            pages = len(re.findall(rb"/Type\s*/Page\b", blob)); tounicode = b"/ToUnicode" in blob
+            kind = "text" if fonts and not imgs else "scanned/image" if imgs and not fonts else "mixed" if imgs and fonts else "unknown"
+            cnt[kind] += 1
+            if len(lines) < 10: lines.append(f"{os.path.basename(p)[:45]:45s} pages~{pages:3d} fonts {fonts:3d} images {imgs:3d} ToUnicode {tounicode}  => {kind}")
+        except Exception as e:
+            cnt["unreadable"] += 1
+    print(f"PDF files: {len(files)}   sampled: {len(sample)}\n  " + "\n  ".join(f"{k}: {v}" for k, v in cnt.most_common()) + "\n")
+    for l in lines: print(l)
+
 def cmd_undo(a):
     n = 0
     if os.path.isdir(a.log):                       # a folder: use its newest rename_log_*.csv
@@ -1187,6 +1212,8 @@ def main():
     p.add_argument("--seed", type=int, default=1); p.set_defaults(fn=cmd_xlsxpeek)
     p = sp.add_parser("xlsxnames"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
     p.add_argument("-n", type=int, default=25); p.set_defaults(fn=cmd_xlsxnames)
+    p = sp.add_parser("pdfstat"); p.add_argument("folder"); p.add_argument("-n", type=int, default=200)
+    p.add_argument("--seed", type=int, default=1); p.set_defaults(fn=cmd_pdfstat)
     p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
