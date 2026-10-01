@@ -699,6 +699,126 @@ def cmd_previews(a):
                 w.writerow([old, "", "skipped", "", str(e)])
     print(f"Renamed: {ok}\nUndo log: {logp}")
 
+def _picture_map(pdir, root):
+    """Return [(docx_path, png_path)] linking each preview picture to its CURRENT Word file."""
+    key = lambda rel: re.sub(r'[\\/:*?"<>|]', " - ", rel) + ".png"
+    cur = {}
+    for p in iter_files(root):
+        if p.lower().endswith(".docx"): cur[key(os.path.relpath(p, root))] = p
+    existing = set(cur.values())
+    moved = {}
+    for lg in sorted(f for f in os.listdir(root) if f.startswith("rename_log_") and f.endswith(".csv")):
+        with open(os.path.join(root, lg), newline="", encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                if r["status"] == "renamed": moved[r["old_path"]] = r["new_path"]
+    for rl in list(moved):
+        d, hops = moved[rl], 0
+        while d in moved and d != moved[d] and hops < 20: d = moved[d]; hops += 1
+        if d in existing: cur.setdefault(key(os.path.relpath(rl, root)), d)
+    out, used = [], set()
+    for png in sorted(os.listdir(pdir)):
+        if not png.lower().endswith(".png"): continue
+        cand = [png]
+        m = re.match(r"^قضية رقم ؟ - (.*)\.png$", png)       # picture renamed because no case number
+        if m: cand += [m.group(1) + ".docx.png", m.group(1) + ".png"]
+        for c in cand:
+            d = cur.get(c)
+            if d and d not in used:
+                used.add(d); out.append((d, os.path.join(pdir, png))); break
+    return out
+
+_JPG_PS = r"""
+Add-Type -AssemblyName System.Drawing
+$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+$ep = New-Object System.Drawing.Imaging.EncoderParameters(1)
+$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]80)
+Import-Csv -LiteralPath $args[0] -Encoding UTF8 | ForEach-Object {
+  try {
+    $img = [System.Drawing.Image]::FromFile($_.png)
+    $sc = 256.0 / [Math]::Max($img.Width, $img.Height)
+    $w = [Math]::Max(1, [int]($img.Width * $sc)); $h = [Math]::Max(1, [int]($img.Height * $sc))
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.Clear([System.Drawing.Color]::White)
+    $g.InterpolationMode = 'HighQualityBicubic'
+    $g.DrawImage($img, 0, 0, $w, $h)
+    $bmp.Save($_.jpg, $codec, $ep)
+    $g.Dispose(); $bmp.Dispose(); $img.Dispose()
+  } catch { }
+}
+"""
+
+_THUMB_REL = "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail"
+
+def embed_thumbnail(docx, jpg_bytes):
+    """Add docProps/thumbnail.jpeg to a .docx without touching its content. Atomic; returns status."""
+    tmp = docx + ".thumbtmp"
+    with zipfile.ZipFile(docx) as zin:
+        names = zin.namelist()
+        if "_rels/.rels" not in names or "[Content_Types].xml" not in names: return "skipped: not a normal docx"
+        if "docProps/thumbnail.jpeg" in names and zin.read("docProps/thumbnail.jpeg") == jpg_bytes: return "already"
+        rels = zin.read("_rels/.rels").decode("utf-8")
+        ct = zin.read("[Content_Types].xml").decode("utf-8")
+        if _THUMB_REL in rels:
+            rels = re.sub(r'(<Relationship\b[^>]*Type="' + re.escape(_THUMB_REL) + r'"[^>]*Target=")[^"]*(")',
+                          r"\1docProps/thumbnail.jpeg\2", rels)
+            rels = re.sub(r'(<Relationship\b[^>]*Target=")[^"]*("[^>]*Type="' + re.escape(_THUMB_REL) + r'")',
+                          r"\1docProps/thumbnail.jpeg\2", rels)
+        else:
+            rels = rels.replace("</Relationships>", f'<Relationship Id="rIdThumb1" Type="{_THUMB_REL}" Target="docProps/thumbnail.jpeg"/></Relationships>')
+        if not re.search(r'Extension="jpe?g"', ct, re.I):
+            ct = re.sub(r"(<Types\b[^>]*>)", r'\1<Default Extension="jpeg" ContentType="image/jpeg"/>', ct, count=1)
+        try:
+            with zipfile.ZipFile(tmp, "w") as zout:
+                for item in zin.infolist():
+                    if item.filename in ("_rels/.rels", "[Content_Types].xml", "docProps/thumbnail.jpeg"): continue
+                    zout.writestr(item, zin.read(item.filename))
+                zout.writestr("_rels/.rels", rels.encode("utf-8"), zipfile.ZIP_DEFLATED)
+                zout.writestr("[Content_Types].xml", ct.encode("utf-8"), zipfile.ZIP_DEFLATED)
+                zout.writestr("docProps/thumbnail.jpeg", jpg_bytes, zipfile.ZIP_STORED)
+            with zipfile.ZipFile(tmp) as chk:                       # verify before replacing
+                if chk.testzip() is not None or len(chk.namelist()) != len(set(names) | {"docProps/thumbnail.jpeg"}):
+                    raise ValueError("verification failed")
+        except Exception as e:
+            if os.path.exists(tmp): os.remove(tmp)
+            return f"failed: {e}"
+    st = os.stat(docx)
+    os.replace(tmp, docx)
+    os.utime(docx, (st.st_atime, st.st_mtime))                      # keep original dates
+    return "added"
+
+def cmd_thumbs(a):
+    """Embed each page-1 picture inside its Word file as the Explorer thumbnail (file stays .docx)."""
+    pdir, root = os.path.abspath(a.previews), os.path.abspath(a.docx_root)
+    print("Linking pictures to Word files...", flush=True)
+    pairs = _picture_map(pdir, root)
+    print(f"  linked: {len(pairs)}", flush=True)
+    if not a.all: pairs = pairs[:a.limit]; print(f"TEST MODE: only the first {len(pairs)} files. Add --all for everything.")
+    jdir = os.path.join(os.environ.get("TEMP", pdir), "thumbs_jpg"); os.makedirs(jdir, exist_ok=True)
+    mp = os.path.join(jdir, "map.csv")
+    with open(mp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f); w.writerow(["png", "jpg"])
+        for i, (d, png) in enumerate(pairs): w.writerow([png, os.path.join(jdir, f"{i}.jpg")])
+    if not a.skip_convert:
+        print("Making small JPEG copies of the pictures (Windows)...", flush=True)
+        ps = os.path.join(jdir, "conv.ps1"); open(ps, "w", encoding="utf-8-sig").write(_JPG_PS)
+        import subprocess
+        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps, mp], check=False)
+    logp = os.path.join(pdir, f"thumbs_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    cnt = collections.Counter()
+    with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
+        w = csv.writer(lf); w.writerow(["docx", "picture", "status"])
+        for i, (d, png) in enumerate(pairs, 1):
+            jp = os.path.join(jdir, f"{i-1}.jpg")
+            try:
+                if not os.path.exists(jp) or os.path.getsize(jp) < 200: st = "skipped: no jpeg made"
+                else: st = embed_thumbnail(d, open(jp, "rb").read())
+            except Exception as e:
+                st = f"failed: {type(e).__name__}: {e}"
+            cnt[st.split(":")[0]] += 1; w.writerow([d, png, st]); lf.flush()
+            if i % 100 == 0: print(f"  {i}/{len(pairs)}  added: {cnt['added']}", flush=True)
+    print(f"\nAdded thumbnails: {cnt['added']}   Already had: {cnt['already']}   Skipped/failed: {len(pairs)-cnt['added']-cnt['already']}\nLog: {logp}")
+
 def cmd_undo(a):
     n = 0
     with open(a.log, newline="", encoding="utf-8-sig") as f:
@@ -774,6 +894,9 @@ def main():
     p.add_argument("--plain", action="store_true", help="with --unknown: do not append the old title")
     p.add_argument("--no-logs", action="store_true", help="skip reading earlier rename logs")
     p.set_defaults(fn=cmd_previews)
+    p = sp.add_parser("thumbs"); p.add_argument("previews"); p.add_argument("docx_root")
+    p.add_argument("--all", action="store_true"); p.add_argument("--limit", type=int, default=3)
+    p.add_argument("--skip-convert", action="store_true"); p.set_defaults(fn=cmd_thumbs)
     p = sp.add_parser("undo"); p.add_argument("log"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
