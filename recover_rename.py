@@ -1193,6 +1193,13 @@ def cmd_pdfocr(a):
         try: import pymupdf
         except ImportError: import fitz
     except ImportError: sys.exit("PyMuPDF is not installed. Run:  py -m pip install pymupdf")
+    import subprocess
+    try:
+        langs = subprocess.run([tess, "--list-langs"], capture_output=True).stdout.decode("utf-8", "ignore").split()
+    except Exception: langs = []
+    if "ara" not in langs:
+        sys.exit("Tesseract has NO Arabic language data (found: " + ", ".join(l for l in langs[1:] if l.isalpha()) + ").\n"
+                 "Install it, then run again. See the instructions I gave you for adding ara.traineddata.")
     root = os.path.abspath(a.folder)
     files = [p for p in iter_files(root) if p.lower().endswith(".pdf")]
     cache_p = os.path.join(root, "ocr_cache.csv"); cache = {}
