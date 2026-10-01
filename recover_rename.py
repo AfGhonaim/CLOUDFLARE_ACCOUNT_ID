@@ -1165,24 +1165,49 @@ def _fix_dir(text):
         out.append(ln)
     return "\n".join(out)
 
-_OCR_CASE_RE = re.compile(r"(?:القضي\w?|قضي\w?|الدعو[يه]\w?)[^\d]{0,25}?(\d{1,6}(?:\s*[/\\\-]\s*\d{2,4})?)")
+_OCR_CASE_RE = re.compile(r"(?:القضي\w?|قضي\w?|الدعو[يه]\w?)[^\d]{0,10}?(\d{1,6})(?:\s*[/\\\-]\s*((?:19|20)?\d{2})|\s*(?:لسنه|لعام|عام|سنه)\s*((?:19|20)\d{2}))?")
+
+_DOC_WORDS = ("مذكره", "صحيفه", "حكم", "اعلان", "محضر", "شهاده", "عقد", "تقرير", "خطاب", "كتاب", "انذار", "توكيل", "وكاله",
+              "اقرار", "اخطار", "فاتوره", "كشف", "قرار", "مناقصه", "ترخيص", "تفويض", "مستخلص", "طلب", "عريضه", "استئناف",
+              "تظلم", "طعن", "دعوي", "محضر", "ايصال", "شيك", "سند", "بلاغ", "شكوي", "عرض سعر", "تعهد", "اتفاقيه", "ملحق")
+
+def _clean_tok(t):
+    return len(t) >= 3 and _ar_ratio(t) > 0.9
+
+def _doc_type(text):
+    """Document type phrase from the top lines: a document-type word plus up to 3 clean following words."""
+    for ln in text.splitlines():
+        toks = ln.split()
+        nt = [_nrm(t) for t in toks]
+        if any(sw in _nrm(ln) for sw in _STOP_LINES) and not any(nt_.startswith(w) for nt_ in nt for w in _DOC_WORDS): continue
+        for i, t in enumerate(nt):
+            if any(t == w or (t.startswith(w) and len(t) <= len(w) + 3) for w in _DOC_WORDS) and _ar_ratio(toks[i]) > 0.9 and len(t) >= 3:
+                phrase = [toks[i]]
+                for x in toks[i + 1:i + 4]:
+                    if _clean_tok(x) and not any(sw in _nrm(x) for sw in _STOP_LINES): phrase.append(x)
+                    else: break
+                return sanitize(" ".join(phrase), 50)
+    return None
 
 def _name_from_ocr(text, use_titles):
     text = _fix_dir(text)
-    num, snip = _case_from_text(text)
-    if not num:                                   # OCR often misreads one letter of "القضية": match loosely
-        t = re.sub(r"\s+", " ", re.sub(r"[\u064B-\u065F]", "", text).translate(_AR_DIGITS).translate(_NORM))
-        m = _OCR_CASE_RE.search(t)
-        if m:
-            n = re.sub(r"\s*[/\\]\s*|\s*-\s*", "-", m.group(1).strip())
-            if not (len(n) < 2): num = n
+    t = re.sub(r"\s+", " ", re.sub(r"[\u064B-\u065F]", "", text).translate(_AR_DIGITS).translate(_NORM))
+    num = None
+    m = _OCR_CASE_RE.search(t)
+    if m:
+        yr = m.group(2) or m.group(3)
+        num = m.group(1) + ("-" + yr if yr else "")
+        if len(m.group(1)) < 2 and not yr: num = None
+    dtype = _doc_type(text) if use_titles else None
+    if dtype and num: return f"{dtype} - قضية {num}", "type + case number"
     if num: return "قضية " + num, "case number"
+    if dtype: return dtype, "document type"
     if use_titles:
         for ln in text.splitlines():
             ln = re.sub(r"\s+", " ", ln).strip()
-            words = [w for w in ln.split() if len(w) >= 2 and _ar_ratio(w) > 0.8]
-            if 8 <= len(ln) <= 90 and len(words) >= 2 and _ar_ratio(ln) > 0.8 and not any(w in _nrm(ln) for w in _STOP_LINES):
-                return sanitize(" ".join(words[:10]), 70), "title line"
+            words = [w for w in ln.split() if _clean_tok(w)]
+            if 12 <= len(ln) <= 90 and len(words) >= 3 and len(words) >= 0.8 * len(ln.split()) and not any(sw in _nrm(ln) for sw in _STOP_LINES):
+                return sanitize(" ".join(words[:8]), 60), "title line"
     return None, None
 
 def cmd_pdfocr(a):
