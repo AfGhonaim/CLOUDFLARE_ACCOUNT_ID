@@ -1192,6 +1192,19 @@ def _doc_type(text):
                 return sanitize(" ".join(phrase), 50), len(phrase), nt[i]
     return None, 0, ""
 
+_SUBJ_KEYS = ("الموضوع", "موضوع", "بخصوص", "بشان", "بشأن")
+
+def _subject(text):
+    """The 'الموضوع:' (subject) line of a letter: up to 8 clean words after the keyword."""
+    for ln in text.splitlines()[:40]:
+        toks = ln.split(); nt = [_nrm(t).strip(":-") for t in toks]
+        for i, t in enumerate(nt):
+            if any(t == k or t.startswith(k) and len(t) <= len(k) + 2 for k in _SUBJ_KEYS) and _ar_ratio(toks[i]) > 0.8:
+                rest = [x.strip(":-") for x in toks[i + 1:]]
+                words = [x for x in rest if _clean_tok(x) and _nrm(x) not in _FILLER]
+                if len(words) >= 2: return sanitize(" ".join(words[:8]), 60)
+    return None
+
 def _find_date(t):
     for m in re.finditer(r"(\d{4})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{1,2})|(\d{1,2})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{4})", t):
         g = m.groups()
@@ -1209,6 +1222,10 @@ def _name_from_ocr(text, use_titles):
         num = m.group(1) + ("-" + yr if yr else "")
         if len(m.group(1)) < 2 and not yr: num = None
     date = _find_date(t)
+    subj = _subject(text) if use_titles else None
+    if subj:
+        base = f"{subj} {date}" if date else subj
+        return (f"{base} - قضية {num}" if num else base), "subject"
     dtype, nwords, kw = _doc_type(text) if use_titles else (None, 0, "")
     if dtype and nwords == 1 and kw in _GENERIC_TYPES and not (num or date): dtype = None   # a bare "كتاب"/"عقد" says nothing
     if dtype and num: return f"{dtype} - قضية {num}", "type + case number"
