@@ -1476,9 +1476,9 @@ def cmd_pdfcases(a):
                 n += 1
                 num, pl, df = _merge_case_info(texts)
                 cw.writerow([p, num, pl, df]); cf.flush()
-                if n % 100 == 0:
+                if n % (100 if len(files) >= 1000 else 10) == 0:
                     rate = n / max(1, time.time() - t0)
-                    print(f"  {n}/{len(files)}  about {(len(files) - n) / max(rate, 1e-9) / 60:.0f} min left", flush=True)
+                    print(f"  {n}/{len(files)}  {1/max(rate,1e-9):.1f} s per file  about {(len(files) - n) / max(rate, 1e-9) / 60:.0f} min left", flush=True)
         sp, ncases = _write_case_summary(root, cache_p, sp_name)
         print(f"\nDone. Cases found: {ncases}\nOpen this file in Excel. Type the parties in column final_name (e.g. أحمد ضد محمد) or leave it empty; merge_into = another case number to merge into:\n  {sp}\nThen run the same command with --apply to copy the files.")
         return
