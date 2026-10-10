@@ -1304,6 +1304,180 @@ def cmd_pdfocr(a):
             if name and not a.apply: named += 1
     print(f"\nDone. Processed: {done}   {'Renamed' if a.apply else 'Would be renamed'}: {named}" + (f"\nUndo log: {logp}" if a.apply else ""))
 
+def _flex(word):
+    """Regex for an Arabic word that tolerates أ/إ/ا, ي/ى and ة/ه spelling variants."""
+    m = {"ا": "[اأإآ]", "أ": "[اأإآ]", "إ": "[اأإآ]", "ي": "[يى]", "ى": "[يى]", "ه": "[هة]", "ة": "[هة]"}
+    return "".join(m.get(c, re.escape(c)) for c in word)
+
+_PLAINTIFF = "|".join(_flex(w) for w in ("المدعي", "المدعيه", "الطالب", "المستانف", "المستأنف", "المعارض", "الطاعن"))
+_DEFENDANT = "|".join(_flex(w) for w in ("المدعي عليه", "المدعي عليها", "المطلوب ضده", "المستانف ضده", "المستأنف ضده", "المطعون ضده"))
+_PLAINTIFF_RE = re.compile(r"(?:" + _PLAINTIFF + r")\s*[:：]\s*([^\n|:]{3,60})")
+_DEFENDANT_RE = re.compile(r"(?:" + _DEFENDANT + r")\s*[:：]\s*([^\n|:]{3,60})")
+_VS_RE = re.compile(r"([\u0600-\u06FF][\u0600-\u06FF ]{2,30}?)\s+ضد\s+([\u0600-\u06FF][\u0600-\u06FF ]{2,30})")
+_PARTY_STOP = ("السيد", "السيده", "الاستاذ", "الأستاذ", "شركه", "شركة", "مؤسسه", "مؤسسة", "وكيله", "وكيلها", "وكيل")
+
+def _party_name(raw):
+    toks = [t for t in re.sub(r"[^\w\s]", " ", raw).split() if _clean_tok(t) and _nrm(t) not in ("السيد", "السيده", "الاستاذ")]
+    return " ".join(toks[:3]) if len(toks) >= 1 and sum(len(t) for t in toks[:3]) >= 5 else ""
+
+_BIDI = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+def _party_from_line(toks, i):
+    """Clean words after label token i (skipping noise and a following 'عليه')."""
+    vals = []
+    for x in toks[i + 1:i + 8]:
+        x = x.strip(":：-.,")
+        nx = _nrm(x)
+        if nx.startswith("علي") and not vals: continue
+        if nx in ("السيد", "السيده", "الاستاذ", "المحامي", "وكيله", "وكيلها", "وكيل"): continue
+        if _clean_tok(x): vals.append(x)
+        elif vals: break
+        if len(vals) == 3: break
+    return " ".join(vals) if sum(len(v) for v in vals) >= 5 else ""
+
+def _extract_case_info(text):
+    """(case_number, plaintiff, defendant) from OCR text of page 1; any may be ''."""
+    text = _BIDI.sub("", _fix_dir(text))
+    t = re.sub(r"\s+", " ", re.sub(r"[\u064B-\u065F]", "", text).translate(_AR_DIGITS).translate(_NORM))
+    num = ""
+    m = _OCR_CASE_RE.search(t)
+    if m:
+        yr = m.group(2) or m.group(3)
+        num = m.group(1) + ("-" + yr if yr else "")
+        if len(m.group(1)) < 2 and not yr: num = ""
+    pl = df = ""
+    for ln in text.splitlines():
+        toks = ln.split(); nt = [_nrm(x).strip(":：") for x in toks]
+        for i, x in enumerate(nt):
+            if not x.startswith("المدع") and not x.startswith("المطلوب") and not x.startswith("المستان") and not x.startswith("الطالب"): continue
+            nxt = nt[i + 1] if i + 1 < len(nt) else ""
+            is_def = (nxt.startswith("علي") and x.startswith("المدع")) or x.startswith("المطلوب") or (x.startswith("المستان") and nxt.startswith("ضد"))
+            val = _party_from_line(toks, i + (1 if is_def and nxt.startswith("علي") else 0))
+            if val and is_def and not df: df = val
+            elif val and not is_def and not pl: pl = val
+            break
+    if not (pl and df):
+        v = _VS_RE.search(text)
+        if v:
+            pl = pl or _party_name(v.group(1)); df = df or _party_name(v.group(2))
+    return num, pl, df
+
+def _pdf_case_files(root):
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if not d.startswith("قضية ") and d not in SYSTEM_DIRS]
+        for n in sorted(fn):
+            if n.lower().endswith(".pdf"): yield os.path.join(dp, n)
+
+def _case_task(args):
+    p, tess, dpi, top = args
+    try: return p, _ocr_first_page(p, tess, dpi, top)
+    except BaseException: return p, ""
+
+def _write_case_summary(root, cache_p):
+    rows = collections.defaultdict(lambda: {"n": 0, "pl": collections.Counter(), "df": collections.Counter()})
+    with open(cache_p, newline="", encoding="utf-8-sig") as f:
+        for r in csv.reader(f):
+            if len(r) < 4 or not r[1]: continue
+            d = rows[r[1]]; d["n"] += 1
+            if r[2]: d["pl"][r[2]] += 1
+            if r[3]: d["df"][r[3]] += 1
+    sp = os.path.join(root, "cases_summary.csv")
+    old = {}
+    if os.path.exists(sp):                                         # keep the user's earlier edits
+        with open(sp, newline="", encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f): old[r["case"]] = r
+    with open(sp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f); w.writerow(["case", "files", "suggested_parties", "final_name", "merge_into", "plaintiff_candidates", "defendant_candidates"])
+        for case, d in sorted(rows.items(), key=lambda kv: -kv[1]["n"]):
+            pl = d["pl"].most_common(1)[0][0] if d["pl"] else ""; df = d["df"].most_common(1)[0][0] if d["df"] else ""
+            sug = f"{pl} ضد {df}" if pl and df else (pl or df)
+            o = old.get(case, {})
+            w.writerow([case, d["n"], sug, o.get("final_name", ""), o.get("merge_into", ""),
+                        " / ".join(k for k, _ in d["pl"].most_common(3)), " / ".join(k for k, _ in d["df"].most_common(3))])
+    return sp, len(rows)
+
+def cmd_pdfcases(a):
+    """Group scanned PDFs by case number into one folder per case (copies). Step 1 analyses; --apply copies."""
+    root = os.path.abspath(a.folder)
+    cache_p = os.path.join(root, "pdf_case_cache.csv")
+    if not a.apply:
+        tess = _find_tesseract()
+        if not tess: sys.exit("Tesseract OCR is not installed.")
+        mine = os.path.join(os.path.expanduser("~"), "tessdata")
+        if os.path.exists(os.path.join(mine, "ara.traineddata")): os.environ["TESSDATA_PREFIX"] = mine
+        done_set = set()
+        if os.path.exists(cache_p):
+            with open(cache_p, newline="", encoding="utf-8-sig") as f: done_set = {r[0] for r in csv.reader(f) if r}
+        files = [p for p in _pdf_case_files(root) if p not in done_set]
+        if a.limit: files = files[:a.limit]
+        print(f"PDFs to analyse now: {len(files)}   (already done: {len(done_set)})", flush=True)
+        from concurrent.futures import ProcessPoolExecutor
+        workers = a.workers or max(1, (os.cpu_count() or 2) - 1)
+        t0, n = time.time(), 0
+        with open(cache_p, "a", newline="", encoding="utf-8-sig") as cf, ProcessPoolExecutor(max_workers=workers) as ex:
+            cw = csv.writer(cf)
+            for p, text in ex.map(_case_task, [(p, tess, a.dpi, a.top) for p in files], chunksize=2):
+                n += 1
+                num, pl, df = _extract_case_info(text)
+                cw.writerow([p, num, pl, df]); cf.flush()
+                if n % 100 == 0:
+                    rate = n / max(1, time.time() - t0)
+                    print(f"  {n}/{len(files)}  about {(len(files) - n) / max(rate, 1e-9) / 60:.0f} min left", flush=True)
+        sp, ncases = _write_case_summary(root, cache_p)
+        print(f"\nDone. Cases found: {ncases}\nOpen this file in Excel. Type the parties in column final_name (e.g. أحمد ضد محمد) or leave it empty; merge_into = another case number to merge into:\n  {sp}\nThen run the same command with --apply to copy the files.")
+        return
+    sp = os.path.join(root, "cases_summary.csv")
+    if not (os.path.exists(sp) and os.path.exists(cache_p)): sys.exit("Run the analysis step first (without --apply).")
+    folder_of = {}
+    with open(sp, newline="", encoding="utf-8-sig") as f:
+        srows = list(csv.DictReader(f))
+    for r in srows:
+        base = "قضية " + r["case"]
+        folder_of[r["case"]] = sanitize(base + (" - " + r["final_name"].strip() if r["final_name"].strip() else ""), 100)
+    for r in srows:
+        if r["merge_into"].strip() and r["merge_into"].strip() in folder_of: folder_of[r["case"]] = folder_of[r["merge_into"].strip()]
+    jobs = []
+    with open(cache_p, newline="", encoding="utf-8-sig") as f:
+        for r in csv.reader(f):
+            if len(r) >= 2 and r[1] in folder_of and os.path.exists(r[0]): jobs.append((r[0], folder_of[r[1]]))
+    need = sum(os.path.getsize(src) for src, _ in jobs)
+    free = shutil.disk_usage(root).free
+    print(f"Files to copy: {len(jobs)}   size: {need/1e9:.2f} GB   free space: {free/1e9:.2f} GB   case folders: {len(set(d for _, d in jobs))}", flush=True)
+    if need * 1.02 > free and not a.move: sys.exit("Not enough free space to COPY. Free up space, or add --move (moves instead of copying).")
+    if not a.yes:
+        if not sys.stdin.isatty() or input("Type YES (capitals) to " + ("move" if a.move else "copy") + " now: ").strip() != "YES":
+            print("Stopped. Nothing was copied."); return
+    logp = os.path.join(root, f"copy_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"); ok = 0
+    with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
+        w = csv.writer(lf); w.writerow(["source", "copy", "mode"])
+        for src, folder in jobs:
+            try:
+                dd = os.path.join(root, folder); os.makedirs(dd, exist_ok=True)
+                name = os.path.basename(src); dst = os.path.join(dd, name); k = 0
+                while os.path.lexists(dst):
+                    k += 1; dst = os.path.join(dd, f"{os.path.splitext(name)[0]}_{k}.pdf")
+                (shutil.move if a.move else shutil.copy2)(src, dst)
+                w.writerow([src, dst, "move" if a.move else "copy"]); ok += 1
+            except Exception as e: w.writerow([src, "", f"skipped: {e}"])
+            lf.flush()
+    print(f"Done: {ok} files {'moved' if a.move else 'copied'}.\nLog: {logp}\nTo undo: py rr.py pdfcases-undo \"{root}\"")
+
+def cmd_pdfcases_undo(a):
+    root = os.path.abspath(a.folder)
+    logs = sorted(f for f in os.listdir(root) if f.startswith("copy_log_") and f.endswith(".csv"))
+    if not logs: sys.exit("No copy_log found.")
+    n = 0
+    with open(os.path.join(root, logs[-1]), newline="", encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            if r["mode"] == "copy" and r["copy"] and os.path.exists(r["copy"]) and os.path.exists(r["source"]):
+                os.remove(r["copy"]); n += 1
+            elif r["mode"] == "move" and r["copy"] and os.path.exists(r["copy"]) and not os.path.exists(r["source"]):
+                os.rename(r["copy"], r["source"]); n += 1
+    for d in os.listdir(root):
+        dd = os.path.join(root, d)
+        if d.startswith("قضية ") and os.path.isdir(dd) and not os.listdir(dd): os.rmdir(dd)
+    print(f"Undone: {n} files (empty case folders removed).")
+
 def cmd_undo(a):
     n = 0
     if os.path.isdir(a.log):                       # a folder: use its newest rename_log_*.csv
@@ -1404,6 +1578,11 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--workers", type=int, default=0); p.add_argument("--dpi", type=int, default=120)
     p.add_argument("--top", type=float, default=0.5, help="fraction of the page height to read, from the top"); p.set_defaults(fn=cmd_pdfocr)
+    p = sp.add_parser("pdfcases"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
+    p.add_argument("--move", action="store_true"); p.add_argument("--yes", action="store_true")
+    p.add_argument("--limit", type=int, default=0); p.add_argument("--workers", type=int, default=0)
+    p.add_argument("--dpi", type=int, default=120); p.add_argument("--top", type=float, default=0.6); p.set_defaults(fn=cmd_pdfcases)
+    p = sp.add_parser("pdfcases-undo"); p.add_argument("folder"); p.set_defaults(fn=cmd_pdfcases_undo)
     p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
 
