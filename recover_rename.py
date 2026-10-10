@@ -1381,9 +1381,23 @@ def _extract_case_info(text):
             pl = pl or _party_name(v.group(1)); df = df or _party_name(v.group(2))
     return num, pl, df
 
+def _made_dirs(root):
+    """Folder names (directly under root) created by earlier copy runs, from the copy logs."""
+    out = set()
+    try: logs = [f for f in os.listdir(root) if f.startswith("copy_log_") and f.endswith(".csv")]
+    except OSError: return out
+    for lg in logs:
+        with open(os.path.join(root, lg), newline="", encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                if r.get("copy"):
+                    rel = os.path.relpath(os.path.dirname(r["copy"]), root)
+                    if rel != "." and os.sep not in rel: out.add(rel)
+    return out
+
 def _pdf_case_files(root, ext=".pdf"):
+    made = _made_dirs(root)
     for dp, dn, fn in os.walk(root):
-        dn[:] = [d for d in dn if not d.startswith("قضية ") and d not in SYSTEM_DIRS]
+        dn[:] = [d for d in dn if not d.startswith("قضية ") and d not in SYSTEM_DIRS and not (dp == root and d in made)]
         for n in sorted(fn):
             if n.lower().endswith(ext): yield os.path.join(dp, n)
 
@@ -1529,10 +1543,137 @@ def cmd_pdfcases_undo(a):
                 os.remove(r["copy"]); n += 1
             elif r["mode"] == "move" and r["copy"] and os.path.exists(r["copy"]) and not os.path.exists(r["source"]):
                 os.rename(r["copy"], r["source"]); n += 1
-    for d in os.listdir(root):
+    for d in _made_dirs(root) | {d for d in os.listdir(root) if d.startswith("قضية ")}:
         dd = os.path.join(root, d)
-        if d.startswith("قضية ") and os.path.isdir(dd) and not os.listdir(dd): os.rmdir(dd)
+        if os.path.isdir(dd) and not os.listdir(dd): os.rmdir(dd)
     print(f"Undone: {n} files (empty case folders removed).")
+
+def _party_task(args):
+    """OCR pages one by one and stop as soon as a plaintiff/defendant name is found."""
+    p, tess, dpi, top, maxpages = args
+    try:
+        try: import pymupdf
+        except ImportError: import fitz as pymupdf
+        import subprocess, tempfile
+        doc = pymupdf.open(p); n = doc.page_count
+        env = dict(os.environ, OMP_THREAD_LIMIT="1"); pl = df = ""; read = 0
+        with tempfile.TemporaryDirectory() as td:
+            for i in range(min(n, maxpages if maxpages > 0 else n)):
+                pg = doc[i]; r = pg.rect
+                pix = pg.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, clip=pymupdf.Rect(r.x0, r.y0, r.x1, r.y0 + r.height * top))
+                img = os.path.join(td, f"p{i}.png"); pix.save(img); read += 1
+                try: txt = subprocess.run([tess, img, "stdout", "-l", "ara+eng", "--psm", "6"], capture_output=True, timeout=120, env=env).stdout.decode("utf-8", "ignore")
+                except Exception: txt = ""
+                _, a_, b_ = _extract_case_info(txt)
+                pl, df = pl or a_, df or b_
+                if pl or df: break
+        doc.close()
+        return p, pl, df, read
+    except BaseException:
+        return p, "", "", 0
+
+def _party_label(pl, df):
+    return f"{pl} ضد {df}" if pl and df else (pl or df)
+
+def _cluster_parties(labels):
+    """Greedy fuzzy grouping of near-identical party labels. Returns {label: group_label}."""
+    import difflib
+    cnt = collections.Counter(labels); groups = []        # [(key, group_label)]
+    out = {}
+    for lab, _ in cnt.most_common():
+        key = _nrm(lab).replace(" ", "")
+        for gk, gl in groups:
+            if abs(len(gk) - len(key)) <= 4 and difflib.SequenceMatcher(None, gk, key).ratio() >= 0.82:
+                out[lab] = gl; break
+        else:
+            groups.append((key, lab)); out[lab] = lab
+    return out
+
+def _write_party_summary(root, cache_p, sp_name="parties_summary.csv"):
+    items = []
+    with open(cache_p, newline="", encoding="utf-8-sig") as f:
+        for r in csv.reader(f):
+            if len(r) >= 3 and (r[1] or r[2]): items.append((r[0], _party_label(r[1], r[2])))
+    mapping = _cluster_parties([l for _, l in items])
+    groups = collections.defaultdict(lambda: {"n": 0, "variants": collections.Counter()})
+    for _, l in items: g = groups[mapping[l]]; g["n"] += 1; g["variants"][l] += 1
+    sp = os.path.join(root, sp_name); old = {}
+    if os.path.exists(sp):
+        with open(sp, newline="", encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f): old[r["group"]] = r
+    with open(sp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f); w.writerow(["group", "files", "final_name", "merge_into", "variants_seen"])
+        for g, d in sorted(groups.items(), key=lambda kv: -kv[1]["n"]):
+            o = old.get(g, {})
+            w.writerow([g, d["n"], o.get("final_name", ""), o.get("merge_into", ""), " / ".join(k for k, _ in d["variants"].most_common(4))])
+    return sp, len(groups), mapping
+
+def _do_copy(root, jobs, a):
+    need = sum(os.path.getsize(src) for src, _ in jobs); free = shutil.disk_usage(root).free
+    print(f"Files to copy: {len(jobs)}   size: {need/1e9:.2f} GB   free space: {free/1e9:.2f} GB   folders: {len(set(d for _, d in jobs))}", flush=True)
+    if need * 1.02 > free and not a.move: sys.exit("Not enough free space to COPY. Free up space, or add --move.")
+    if not a.yes:
+        if not sys.stdin.isatty() or input("Type YES (capitals) to " + ("move" if a.move else "copy") + " now: ").strip() != "YES":
+            print("Stopped. Nothing was copied."); return
+    logp = os.path.join(root, f"copy_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"); ok = 0
+    with open(logp, "w", newline="", encoding="utf-8-sig") as lf:
+        w = csv.writer(lf); w.writerow(["source", "copy", "mode"])
+        for src, folder in jobs:
+            try:
+                dd = os.path.join(root, folder); os.makedirs(dd, exist_ok=True)
+                name = os.path.basename(src); dst = os.path.join(dd, name); k = 0
+                while os.path.lexists(dst):
+                    k += 1; dst = os.path.join(dd, f"{os.path.splitext(name)[0]}_{k}{os.path.splitext(name)[1]}")
+                (shutil.move if a.move else shutil.copy2)(src, dst)
+                w.writerow([src, dst, "move" if a.move else "copy"]); ok += 1
+            except Exception as e: w.writerow([src, "", f"skipped: {e}"])
+            lf.flush()
+    print(f"Done: {ok} files {'moved' if a.move else 'copied'}.\nLog: {logp}")
+
+def cmd_pdfparties(a):
+    """Folder per dispute, named by the parties (e.g. 'أحمد ضد محمد'); reads pages until a party name is found."""
+    root = os.path.abspath(a.folder)
+    cache_p = os.path.join(root, "pdf_party_cache.csv")
+    if not a.apply:
+        tess = _find_tesseract()
+        if not tess: sys.exit("Tesseract OCR is not installed.")
+        mine = os.path.join(os.path.expanduser("~"), "tessdata")
+        if os.path.exists(os.path.join(mine, "ara.traineddata")): os.environ["TESSDATA_PREFIX"] = mine
+        done_set = set()
+        if a.rescan and os.path.exists(cache_p): os.replace(cache_p, cache_p + ".bak"); print("Old results kept as .bak; analysing again.", flush=True)
+        if os.path.exists(cache_p):
+            with open(cache_p, newline="", encoding="utf-8-sig") as f: done_set = {r[0] for r in csv.reader(f) if r}
+        files = [q for q in _pdf_case_files(root) if q not in done_set]
+        if a.limit: files = files[:a.limit]
+        print(f"PDFs to analyse now: {len(files)}   (already done: {len(done_set)})   up to {a.maxpages or 'all'} pages each, stops when a party name is found", flush=True)
+        from concurrent.futures import ProcessPoolExecutor
+        workers = a.workers or max(1, (os.cpu_count() or 2) - 1); t0 = time.time(); n = found = 0
+        with open(cache_p, "a", newline="", encoding="utf-8-sig") as cf, ProcessPoolExecutor(max_workers=workers) as ex:
+            cw = csv.writer(cf)
+            for q, pl, df, read in ex.map(_party_task, [(q, tess, a.dpi, a.top, a.maxpages) for q in files], chunksize=2):
+                n += 1; found += 1 if (pl or df) else 0
+                cw.writerow([q, pl, df, read]); cf.flush()
+                if n % (100 if len(files) >= 1000 else 10) == 0:
+                    rate = n / max(1, time.time() - t0)
+                    print(f"  {n}/{len(files)}  parties found in {found}  {1/max(rate,1e-9):.1f} s per file  about {(len(files)-n)/max(rate,1e-9)/60:.0f} min left", flush=True)
+        sp, ng, _ = _write_party_summary(root, cache_p)
+        print(f"\nDone. Disputes (groups) found: {ng}\nOpen in Excel, fix names in final_name, merge duplicates with merge_into, save as CSV UTF-8:\n  {sp}\nThen run again with --apply.")
+        return
+    sp = os.path.join(root, "parties_summary.csv")
+    if not (os.path.exists(sp) and os.path.exists(cache_p)): sys.exit("Run the analysis step first (without --apply).")
+    _, _, mapping = _write_party_summary(root, cache_p)
+    with open(sp, newline="", encoding="utf-8-sig") as f: srows = list(csv.DictReader(f))
+    folder_of = {r["group"]: sanitize((r["final_name"].strip() or r["group"]), 100) for r in srows}
+    for r in srows:
+        m_ = r["merge_into"].strip()
+        if m_ and m_ in folder_of: folder_of[r["group"]] = folder_of[m_]
+    jobs = []
+    with open(cache_p, newline="", encoding="utf-8-sig") as f:
+        for r in csv.reader(f):
+            if len(r) >= 3 and (r[1] or r[2]) and os.path.exists(r[0]):
+                g = mapping.get(_party_label(r[1], r[2])); fo = folder_of.get(g)
+                if fo: jobs.append((r[0], fo))
+    _do_copy(root, jobs, a)
 
 def cmd_undo(a):
     n = 0
@@ -1639,6 +1780,11 @@ def main():
     p.add_argument("--limit", type=int, default=0); p.add_argument("--workers", type=int, default=0)
     p.add_argument("--dpi", type=int, default=120); p.add_argument("--top", type=float, default=0.6)
     p.add_argument("--pages", type=int, default=1, help="pages to read per PDF (0 = all)"); p.add_argument("--rescan", action="store_true"); p.set_defaults(fn=cmd_pdfcases)
+    p = sp.add_parser("pdfparties"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
+    p.add_argument("--move", action="store_true"); p.add_argument("--yes", action="store_true"); p.add_argument("--rescan", action="store_true")
+    p.add_argument("--limit", type=int, default=0); p.add_argument("--workers", type=int, default=0)
+    p.add_argument("--dpi", type=int, default=120); p.add_argument("--top", type=float, default=1.0)
+    p.add_argument("--maxpages", type=int, default=5, help="max pages to read per PDF (0 = all)"); p.set_defaults(fn=cmd_pdfparties)
     p = sp.add_parser("pdfcases-undo"); p.add_argument("folder"); p.set_defaults(fn=cmd_pdfcases_undo)
     p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
