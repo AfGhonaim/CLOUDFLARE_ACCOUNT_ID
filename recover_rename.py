@@ -1146,6 +1146,25 @@ def _ocr_first_page(pdf, tess, dpi=120, top=0.5):
         res = subprocess.run([tess, img, "stdout", "-l", "ara+eng", "--psm", "6"], capture_output=True, timeout=120, env=env)
     return res.stdout.decode("utf-8", "ignore")
 
+def _ocr_pages(pdf, tess, dpi=120, top=1.0, npages=3):
+    """OCR up to npages pages of a PDF (whole page height by default); returns a list of texts."""
+    try: import pymupdf
+    except ImportError: import fitz as pymupdf
+    import subprocess, tempfile
+    doc = pymupdf.open(pdf); n = doc.page_count; texts = []
+    env = dict(os.environ, OMP_THREAD_LIMIT="1")
+    with tempfile.TemporaryDirectory() as td:
+        for i in range(min(n, npages if npages > 0 else n)):
+            pg = doc[i]; r = pg.rect
+            pix = pg.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, clip=pymupdf.Rect(r.x0, r.y0, r.x1, r.y0 + r.height * top))
+            img = os.path.join(td, f"p{i}.png"); pix.save(img)
+            try:
+                res = subprocess.run([tess, img, "stdout", "-l", "ara+eng", "--psm", "6"], capture_output=True, timeout=120, env=env)
+                texts.append(res.stdout.decode("utf-8", "ignore"))
+            except Exception: texts.append("")
+    doc.close()
+    return texts
+
 def _ocr_task(args):
     p, tess, dpi, top = args
     try: return p, _ocr_first_page(p, tess, dpi, top)
@@ -1371,9 +1390,20 @@ def _pdf_case_files(root, ext=".pdf"):
 _NAME_CASE = re.compile(r"^قضية (\d+(?:-\d+)?)(?:_\d+)?$")
 
 def _case_task(args):
-    p, tess, dpi, top = args
-    try: return p, _ocr_first_page(p, tess, dpi, top)
-    except BaseException: return p, ""
+    p, tess, dpi, top, npages = args
+    try: return p, _ocr_pages(p, tess, dpi, top, npages)
+    except BaseException: return p, []
+
+def _merge_case_info(texts):
+    """Vote across pages: most frequent case number (years preferred); first parties found."""
+    nums, pls, dfs = collections.Counter(), [], []
+    for t in texts:
+        num, pl, df = _extract_case_info(t)
+        if num: nums[num] += 2 if "-" in num else 1
+        if pl: pls.append(pl)
+        if df: dfs.append(df)
+    num = nums.most_common(1)[0][0] if nums else ""
+    return num, (collections.Counter(pls).most_common(1)[0][0] if pls else ""), (collections.Counter(dfs).most_common(1)[0][0] if dfs else "")
 
 def _write_case_summary(root, cache_p, sp_name="cases_summary.csv"):
     rows = collections.defaultdict(lambda: {"n": 0, "pl": collections.Counter(), "df": collections.Counter()})
@@ -1432,17 +1462,19 @@ def cmd_pdfcases(a):
         done_set = set()
         if os.path.exists(cache_p):
             with open(cache_p, newline="", encoding="utf-8-sig") as f: done_set = {r[0] for r in csv.reader(f) if r}
+        if a.rescan and os.path.exists(cache_p):
+            os.replace(cache_p, cache_p + ".bak"); done_set = set(); print("Old results kept as pdf_case_cache.csv.bak; analysing again.", flush=True)
         files = [p for p in _pdf_case_files(root) if p not in done_set]
         if a.limit: files = files[:a.limit]
-        print(f"PDFs to analyse now: {len(files)}   (already done: {len(done_set)})", flush=True)
+        print(f"PDFs to analyse now: {len(files)}   (already done: {len(done_set)})   pages per file: {'all' if a.pages == 0 else a.pages}   page height read: {int(a.top*100)}%", flush=True)
         from concurrent.futures import ProcessPoolExecutor
         workers = a.workers or max(1, (os.cpu_count() or 2) - 1)
         t0, n = time.time(), 0
         with open(cache_p, "a", newline="", encoding="utf-8-sig") as cf, ProcessPoolExecutor(max_workers=workers) as ex:
             cw = csv.writer(cf)
-            for p, text in ex.map(_case_task, [(p, tess, a.dpi, a.top) for p in files], chunksize=2):
+            for p, texts in ex.map(_case_task, [(p, tess, a.dpi, a.top, a.pages) for p in files], chunksize=2):
                 n += 1
-                num, pl, df = _extract_case_info(text)
+                num, pl, df = _merge_case_info(texts)
                 cw.writerow([p, num, pl, df]); cf.flush()
                 if n % 100 == 0:
                     rate = n / max(1, time.time() - t0)
@@ -1605,7 +1637,8 @@ def main():
     p = sp.add_parser("pdfcases"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
     p.add_argument("--move", action="store_true"); p.add_argument("--yes", action="store_true"); p.add_argument("--docx", action="store_true")
     p.add_argument("--limit", type=int, default=0); p.add_argument("--workers", type=int, default=0)
-    p.add_argument("--dpi", type=int, default=120); p.add_argument("--top", type=float, default=0.6); p.set_defaults(fn=cmd_pdfcases)
+    p.add_argument("--dpi", type=int, default=120); p.add_argument("--top", type=float, default=0.6)
+    p.add_argument("--pages", type=int, default=1, help="pages to read per PDF (0 = all)"); p.add_argument("--rescan", action="store_true"); p.set_defaults(fn=cmd_pdfcases)
     p = sp.add_parser("pdfcases-undo"); p.add_argument("folder"); p.set_defaults(fn=cmd_pdfcases_undo)
     p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
