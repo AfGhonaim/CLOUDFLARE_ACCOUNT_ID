@@ -1362,18 +1362,20 @@ def _extract_case_info(text):
             pl = pl or _party_name(v.group(1)); df = df or _party_name(v.group(2))
     return num, pl, df
 
-def _pdf_case_files(root):
+def _pdf_case_files(root, ext=".pdf"):
     for dp, dn, fn in os.walk(root):
         dn[:] = [d for d in dn if not d.startswith("قضية ") and d not in SYSTEM_DIRS]
         for n in sorted(fn):
-            if n.lower().endswith(".pdf"): yield os.path.join(dp, n)
+            if n.lower().endswith(ext): yield os.path.join(dp, n)
+
+_NAME_CASE = re.compile(r"^قضية (\d+(?:-\d+)?)(?:_\d+)?$")
 
 def _case_task(args):
     p, tess, dpi, top = args
     try: return p, _ocr_first_page(p, tess, dpi, top)
     except BaseException: return p, ""
 
-def _write_case_summary(root, cache_p):
+def _write_case_summary(root, cache_p, sp_name="cases_summary.csv"):
     rows = collections.defaultdict(lambda: {"n": 0, "pl": collections.Counter(), "df": collections.Counter()})
     with open(cache_p, newline="", encoding="utf-8-sig") as f:
         for r in csv.reader(f):
@@ -1381,7 +1383,7 @@ def _write_case_summary(root, cache_p):
             d = rows[r[1]]; d["n"] += 1
             if r[2]: d["pl"][r[2]] += 1
             if r[3]: d["df"][r[3]] += 1
-    sp = os.path.join(root, "cases_summary.csv")
+    sp = os.path.join(root, sp_name)
     old = {}
     if os.path.exists(sp):                                         # keep the user's earlier edits
         with open(sp, newline="", encoding="utf-8-sig") as f:
@@ -1399,7 +1401,29 @@ def _write_case_summary(root, cache_p):
 def cmd_pdfcases(a):
     """Group scanned PDFs by case number into one folder per case (copies). Step 1 analyses; --apply copies."""
     root = os.path.abspath(a.folder)
-    cache_p = os.path.join(root, "pdf_case_cache.csv")
+    ext = ".docx" if a.docx else ".pdf"
+    cache_p = os.path.join(root, ext[1:] + "_case_cache.csv")
+    sp_name = "cases_summary.csv" if ext == ".pdf" else "cases_summary_docx.csv"
+    if not a.apply and a.docx:
+        done_set = set()
+        if os.path.exists(cache_p):
+            with open(cache_p, newline="", encoding="utf-8-sig") as f: done_set = {r[0] for r in csv.reader(f) if r}
+        files = [q for q in _pdf_case_files(root, ".docx") if q not in done_set]
+        if a.limit: files = files[:a.limit]
+        print(f"Word files to analyse now: {len(files)}   (already done: {len(done_set)})", flush=True)
+        with open(cache_p, "a", newline="", encoding="utf-8-sig") as cf:
+            cw = csv.writer(cf)
+            for i, q in enumerate(files, 1):
+                try: text = docx_text(q)
+                except Exception: text = ""
+                num, pl, df = _extract_case_info(text)
+                m = _NAME_CASE.match(os.path.splitext(os.path.basename(q))[0])
+                if m: num = m.group(1)                       # a name already built from the case number wins
+                cw.writerow([q, num, pl, df]); cf.flush()
+                if i % 500 == 0: print(f"  {i}/{len(files)}", flush=True)
+        sp, ncases = _write_case_summary(root, cache_p, sp_name)
+        print(f"\nDone. Cases found: {ncases}\nOpen this file in Excel and fill column final_name (e.g. أحمد ضد محمد), then save it as CSV UTF-8:\n  {sp}\nThen run the same command with --apply to copy the files.")
+        return
     if not a.apply:
         tess = _find_tesseract()
         if not tess: sys.exit("Tesseract OCR is not installed.")
@@ -1423,10 +1447,10 @@ def cmd_pdfcases(a):
                 if n % 100 == 0:
                     rate = n / max(1, time.time() - t0)
                     print(f"  {n}/{len(files)}  about {(len(files) - n) / max(rate, 1e-9) / 60:.0f} min left", flush=True)
-        sp, ncases = _write_case_summary(root, cache_p)
+        sp, ncases = _write_case_summary(root, cache_p, sp_name)
         print(f"\nDone. Cases found: {ncases}\nOpen this file in Excel. Type the parties in column final_name (e.g. أحمد ضد محمد) or leave it empty; merge_into = another case number to merge into:\n  {sp}\nThen run the same command with --apply to copy the files.")
         return
-    sp = os.path.join(root, "cases_summary.csv")
+    sp = os.path.join(root, sp_name)
     if not (os.path.exists(sp) and os.path.exists(cache_p)): sys.exit("Run the analysis step first (without --apply).")
     folder_of = {}
     with open(sp, newline="", encoding="utf-8-sig") as f:
@@ -1455,7 +1479,7 @@ def cmd_pdfcases(a):
                 dd = os.path.join(root, folder); os.makedirs(dd, exist_ok=True)
                 name = os.path.basename(src); dst = os.path.join(dd, name); k = 0
                 while os.path.lexists(dst):
-                    k += 1; dst = os.path.join(dd, f"{os.path.splitext(name)[0]}_{k}.pdf")
+                    k += 1; dst = os.path.join(dd, f"{os.path.splitext(name)[0]}_{k}{os.path.splitext(name)[1]}")
                 (shutil.move if a.move else shutil.copy2)(src, dst)
                 w.writerow([src, dst, "move" if a.move else "copy"]); ok += 1
             except Exception as e: w.writerow([src, "", f"skipped: {e}"])
@@ -1579,7 +1603,7 @@ def main():
     p.add_argument("--workers", type=int, default=0); p.add_argument("--dpi", type=int, default=120)
     p.add_argument("--top", type=float, default=0.5, help="fraction of the page height to read, from the top"); p.set_defaults(fn=cmd_pdfocr)
     p = sp.add_parser("pdfcases"); p.add_argument("folder"); p.add_argument("--apply", action="store_true")
-    p.add_argument("--move", action="store_true"); p.add_argument("--yes", action="store_true")
+    p.add_argument("--move", action="store_true"); p.add_argument("--yes", action="store_true"); p.add_argument("--docx", action="store_true")
     p.add_argument("--limit", type=int, default=0); p.add_argument("--workers", type=int, default=0)
     p.add_argument("--dpi", type=int, default=120); p.add_argument("--top", type=float, default=0.6); p.set_defaults(fn=cmd_pdfcases)
     p = sp.add_parser("pdfcases-undo"); p.add_argument("folder"); p.set_defaults(fn=cmd_pdfcases_undo)
