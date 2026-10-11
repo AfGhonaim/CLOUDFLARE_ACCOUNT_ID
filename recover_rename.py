@@ -1683,10 +1683,15 @@ def cmd_pdfparties(a):
     if not (os.path.exists(sp) and os.path.exists(cache_p)): sys.exit("Run the analysis step first (without --apply).")
     _, _, mapping = _write_party_summary(work, cache_p)
     with open(sp, newline="", encoding="utf-8-sig") as f: srows = list(csv.DictReader(f))
-    folder_of = {r["group"]: sanitize((r["final_name"].strip() or r["group"]), 100) for r in srows}
+    folder_of = {}
+    for r in srows:
+        fn = r["final_name"].strip()
+        if fn.upper() == "SKIP": continue                                   # user chose not to make a folder
+        if a.min_files > 1 and int(r["files"] or 0) < a.min_files and not fn: continue   # tiny groups are usually OCR noise
+        folder_of[r["group"]] = sanitize(fn or r["group"], 100)
     for r in srows:
         m_ = r["merge_into"].strip()
-        if m_ and m_ in folder_of: folder_of[r["group"]] = folder_of[m_]
+        if m_ and m_ in folder_of and r["group"] in folder_of: folder_of[r["group"]] = folder_of[m_]
     jobs = []
     with open(cache_p, newline="", encoding="utf-8-sig") as f:
         for r in csv.reader(f):
@@ -1804,7 +1809,8 @@ def main():
     p.add_argument("--move", action="store_true"); p.add_argument("--yes", action="store_true"); p.add_argument("--rescan", action="store_true")
     p.add_argument("--limit", type=int, default=0); p.add_argument("--workers", type=int, default=0)
     p.add_argument("--dpi", type=int, default=120); p.add_argument("--top", type=float, default=1.0)
-    p.add_argument("--maxpages", type=int, default=5, help="max pages to read per PDF (0 = all)"); p.set_defaults(fn=cmd_pdfparties)
+    p.add_argument("--maxpages", type=int, default=5, help="max pages to read per PDF (0 = all)")
+    p.add_argument("--min-files", type=int, default=1, help="only make folders for groups with at least this many files"); p.set_defaults(fn=cmd_pdfparties)
     p = sp.add_parser("pdfcases-undo"); p.add_argument("folder"); p.set_defaults(fn=cmd_pdfcases_undo)
     p = sp.add_parser("undo"); p.add_argument("log"); p.add_argument("--ext", default="", help="only undo files with this extension, e.g. .pdf"); p.set_defaults(fn=cmd_undo)
     a = ap.parse_args(); a.fn(a)
