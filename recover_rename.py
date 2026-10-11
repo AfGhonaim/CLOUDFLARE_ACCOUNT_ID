@@ -1630,10 +1630,30 @@ def _do_copy(root, jobs, a):
             lf.flush()
     print(f"Done: {ok} files {'moved' if a.move else 'copied'}.\nLog: {logp}")
 
+def _work_dir(root):
+    """Local working folder (on the system drive) for cache/summary files, so a flaky external drive can't break the run."""
+    import hashlib
+    d = os.path.join(os.path.expanduser("~"), "recover_work", hashlib.md5(root.lower().encode("utf-8")).hexdigest()[:8] + "_" + (os.path.basename(root) or "root"))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _safe_write(cw, cf, row):
+    for k in range(6):
+        try: cw.writerow(row); cf.flush(); return True
+        except OSError as e:
+            print(f"  (write problem: {e}; retrying in 10 s)", flush=True); time.sleep(10)
+    return False
+
 def cmd_pdfparties(a):
     """Folder per dispute, named by the parties (e.g. 'أحمد ضد محمد'); reads pages until a party name is found."""
     root = os.path.abspath(a.folder)
-    cache_p = os.path.join(root, "pdf_party_cache.csv")
+    work = _work_dir(root)
+    cache_p = os.path.join(work, "pdf_party_cache.csv")
+    legacy = os.path.join(root, "pdf_party_cache.csv")
+    if not os.path.exists(cache_p) and os.path.exists(legacy):
+        try: shutil.copy2(legacy, cache_p); print("Copied earlier progress from the drive to the working folder.", flush=True)
+        except OSError: pass
+    print(f"Working files (progress + summary) are kept in: {work}", flush=True)
     if not a.apply:
         tess = _find_tesseract()
         if not tess: sys.exit("Tesseract OCR is not installed.")
@@ -1652,16 +1672,16 @@ def cmd_pdfparties(a):
             cw = csv.writer(cf)
             for q, pl, df, read in ex.map(_party_task, [(q, tess, a.dpi, a.top, a.maxpages) for q in files], chunksize=2):
                 n += 1; found += 1 if (pl or df) else 0
-                cw.writerow([q, pl, df, read]); cf.flush()
+                if not _safe_write(cw, cf, [q, pl, df, read]): sys.exit("Cannot write the progress file. Check the C: drive space and run again; progress so far is saved.")
                 if n % (100 if len(files) >= 1000 else 10) == 0:
                     rate = n / max(1, time.time() - t0)
                     print(f"  {n}/{len(files)}  parties found in {found}  {1/max(rate,1e-9):.1f} s per file  about {(len(files)-n)/max(rate,1e-9)/60:.0f} min left", flush=True)
-        sp, ng, _ = _write_party_summary(root, cache_p)
+        sp, ng, _ = _write_party_summary(work, cache_p)
         print(f"\nDone. Disputes (groups) found: {ng}\nOpen in Excel, fix names in final_name, merge duplicates with merge_into, save as CSV UTF-8:\n  {sp}\nThen run again with --apply.")
         return
-    sp = os.path.join(root, "parties_summary.csv")
+    sp = os.path.join(work, "parties_summary.csv")
     if not (os.path.exists(sp) and os.path.exists(cache_p)): sys.exit("Run the analysis step first (without --apply).")
-    _, _, mapping = _write_party_summary(root, cache_p)
+    _, _, mapping = _write_party_summary(work, cache_p)
     with open(sp, newline="", encoding="utf-8-sig") as f: srows = list(csv.DictReader(f))
     folder_of = {r["group"]: sanitize((r["final_name"].strip() or r["group"]), 100) for r in srows}
     for r in srows:
